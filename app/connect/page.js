@@ -43,8 +43,8 @@ export default function ConnectPage() {
   }
 
   return (
-    <div className="min-h-screen w-full flex items-center justify-center px-4 py-8 bg-black">
-      <div className="w-full max-w-xl">
+    <div className="fixed inset-0 flex items-center justify-center px-4 py-8 pointer-events-none">
+      <div className="w-full max-w-xl pointer-events-auto">
         {/* Header */}
         <div className="mb-12">
           <h1 className="text-5xl font-bold text-white mb-3">DB Agent</h1>
@@ -67,7 +67,7 @@ export default function ConnectPage() {
                 setUri(e.target.value);
                 setError("");
               }}
-              className="w-full px-4 py-3 bg-neutral-900 border border-neutral-800 hover:border-neutral-700 rounded-lg text-white placeholder-gray-600 focus:outline-none focus:border-white focus:ring-1 focus:ring-white/20 transition-all resize-none text-sm font-mono"
+              className="w-full px-4 py-3 bg-black/20 backdrop-blur-md border border-neutral-800/50 hover:border-neutral-700/50 rounded-lg text-white placeholder-gray-600 focus:outline-none focus:border-white/50 focus:ring-1 focus:ring-white/20 transition-all resize-none text-sm font-mono"
               rows={5}
             />
             <p className="text-xs text-gray-500 mt-2">
@@ -77,14 +77,14 @@ export default function ConnectPage() {
 
           {/* Error Message */}
           {error && (
-            <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+            <div className="p-4 rounded-lg bg-red-500/10 backdrop-blur-md border border-red-500/30 text-red-400 text-sm">
               {error}
             </div>
           )}
 
           {/* Status Message */}
           {status && (
-            <div className="p-4 rounded-lg bg-green-500/10 border border-green-500/30 text-green-400 text-sm">
+            <div className="p-4 rounded-lg bg-green-500/10 backdrop-blur-md border border-green-500/30 text-green-400 text-sm">
               {status}
             </div>
           )}
@@ -100,7 +100,7 @@ export default function ConnectPage() {
         </div>
 
         {/* Help Section */}
-        <div className="mt-12 pt-8 border-t border-neutral-800">
+        <div className="mt-12 pt-8 border-t border-neutral-800/50">
           <h3 className="text-sm font-semibold text-white mb-4">Quick Start</h3>
           <ol className="text-sm text-gray-400 space-y-2">
             <li>1. Go to MongoDB Atlas Dashboard</li>

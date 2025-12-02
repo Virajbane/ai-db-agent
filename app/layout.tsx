@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { BackgroundRippleEffect } from "@/components/ui/background-ripple-effect";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -24,9 +25,16 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
-        {children}
+        {/* Global Background Ripple Effect */}
+        <div className="fixed inset-0 z-0">
+          <BackgroundRippleEffect />
+        </div>
+        
+        {/* Content Layer */}
+        <div className="relative z-10">
+          {children}
+        </div>
       </body>
     </html>
   );
