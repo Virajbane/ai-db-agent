@@ -1,3 +1,4 @@
+// app/chat/page.js
 "use client";
 import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";

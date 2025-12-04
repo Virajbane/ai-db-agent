@@ -1,3 +1,4 @@
+// app/api/ai/run-query/route.js
 import { NextResponse } from "next/server";
 import { parseUserInstruction } from "@/lib/ai";
 import { logStep, validateAction } from "@/lib/debug";
@@ -102,14 +103,9 @@ export async function POST(req) {
       hasUri: !!uri 
     });
 
-    // Validate API key
-    if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) {
-      logStep(`[${requestId}] MISSING API KEYS`, {}, new Error("No AI API keys configured"));
-      return NextResponse.json(
-        { ok: false, error: "AI API keys missing. Check .env.local for GEMINI_API_KEY or OPENAI_API_KEY" },
-        { status: 500 }
-      );
-    }
+    // ========================================================================
+    // ✅ REMOVED API KEY CHECK - Ollama doesn't need API keys!
+    // ========================================================================
 
     // Validate input
     if (!userText || userText.trim().length === 0) {
@@ -149,13 +145,13 @@ export async function POST(req) {
       logStep(`[${requestId}] NO URI PROVIDED`, { note: "AI will work without schema context" });
     }
 
-    logStep(`[${requestId}] CALLING AI PARSER`, { 
+    logStep(`[${requestId}] CALLING OLLAMA AI`, { 
       userText, 
       hasSchemas: Object.keys(collectionSchemas).length > 0,
       schemaCollections: Object.keys(collectionSchemas)
     });
 
-    // Call AI with schema context
+    // Call Ollama AI with schema context
     const action = await parseUserInstruction({ 
       dbType, 
       userText, 
@@ -164,7 +160,7 @@ export async function POST(req) {
       collectionSchemas // Pass schemas to AI
     });
 
-    logStep(`[${requestId}] AI RESPONSE RECEIVED`, action);
+    logStep(`[${requestId}] OLLAMA RESPONSE RECEIVED`, action);
 
     // Validate parsed action
     const validation = validateAction(action);

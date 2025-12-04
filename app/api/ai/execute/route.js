@@ -1,3 +1,4 @@
+// app/api/ai/execute/route.js
 import { getNativeMongoClient } from "@/lib/db";
 import { logStep, validateAction } from "@/lib/debug";
 
