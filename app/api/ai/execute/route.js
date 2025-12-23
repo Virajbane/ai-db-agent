@@ -31,6 +31,29 @@ export async function POST(req) {
       return new Response(JSON.stringify({ ok: false, error: validation.errors.join("; ") }), { status: 400 });
     }
 
+    // ========================================================================
+    // ✅ NEW: Validate sort values (must be 1 or -1)
+    // ========================================================================
+    if (action.options && action.options.sort) {
+      const sortObj = action.options.sort;
+      const invalidSorts = Object.entries(sortObj).filter(([field, value]) => {
+        return value !== 1 && value !== -1;
+      });
+      
+      if (invalidSorts.length > 0) {
+        const errorMsg = `Invalid sort direction(s): ${invalidSorts.map(([f, v]) => `${f}=${v}`).join(', ')}. Must be 1 (ascending) or -1 (descending).`;
+        logStep(`[${requestId}] INVALID SORT VALUES`, { invalidSorts, sortObj });
+        
+        // Auto-fix: Convert invalid values to 1
+        invalidSorts.forEach(([field]) => {
+          console.warn(`⚠️ Auto-fixing sort value for "${field}": was ${sortObj[field]}, now 1`);
+          action.options.sort[field] = 1;
+        });
+        
+        logStep(`[${requestId}] SORT VALUES AUTO-FIXED`, { fixedSort: action.options.sort });
+      }
+    }
+
     logStep(`[${requestId}] CONNECTING TO MONGODB`);
 
     // Connect to MongoDB
@@ -57,10 +80,17 @@ export async function POST(req) {
     if (action.action === "find") {
       const limit = (action.options && action.options.limit) || 100;
       const sort = (action.options && action.options.sort) || {};
+      const skip = (action.options && action.options.skip) || 0;
       const projection = (action.options && action.options.projection) || null;
       
       // Build find query
       let cursor = col.find(action.query || {});
+      
+      // Apply skip if specified
+      if (skip > 0) {
+        cursor = cursor.skip(skip);
+        resultMetadata.skipped = skip;
+      }
       
       // Apply projection if specified
       if (projection && Object.keys(projection).length > 0) {
@@ -73,6 +103,7 @@ export async function POST(req) {
       
       logStep(`[${requestId}] FIND COMPLETE`, { 
         documentCount: result.length,
+        skipped: skip,
         projectionUsed: resultMetadata.projectionUsed,
         fieldsReturned: resultMetadata.fieldsReturned
       });

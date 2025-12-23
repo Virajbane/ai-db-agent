@@ -34,15 +34,15 @@ export default function ChatPage() {
     setLoading(true);
 
     try {
-      // STEP 1: Parse query with AI (this generates the MongoDB query)
+      // Call Ollama AI to parse query
       const res = await fetch("/api/ai/run-query", {
         method: "POST",
         body: JSON.stringify({ 
           dbType: "mongodb", 
           userText, 
-          collections: [], 
+          collections: [], // Auto-detect collections
           previewLimit: 50,
-          uri: uri // Send URI so we can fetch schema
+          uri: uri // Send URI for schema detection
         }),
         headers: { "Content-Type": "application/json" },
       });
@@ -53,17 +53,27 @@ export default function ChatPage() {
         throw new Error(data.error || "Failed to parse query");
       }
       
-      // Show generated query
+      // Show generated query with metadata
+      const metadataInfo = data.metadata?.schemaUsed 
+        ? `\n📊 Schema-aware query` 
+        : ``;
+      
       setMessages((m) => [
         ...m,
         { 
           role: "ai", 
-          text: `Generated ${data.action.action} query on "${data.action.collection}"`, 
-          action: data.action 
+          text: `✅ Generated ${data.action.action} query on "${data.action.collection}"${metadataInfo}`, 
+          action: data.action,
+          metadata: data.metadata
         },
       ]);
     } catch (err) {
-      setMessages((m) => [...m, { role: "error", text: err.message }]);
+      // Show helpful error messages
+      const errorMsg = err.message.includes("Ollama") 
+        ? `🔴 ${err.message}\n\nMake sure:\n1. Ollama is installed\n2. Run: ollama serve\n3. Pull model: ollama pull qwen2.5-coder:7b`
+        : err.message;
+        
+      setMessages((m) => [...m, { role: "error", text: errorMsg }]);
     } finally {
       setLoading(false);
     }
@@ -75,12 +85,12 @@ export default function ChatPage() {
       return;
     }
     
-    setMessages((m) => [...m, { role: "system", text: "Fetching preview..." }]);
+    setMessages((m) => [...m, { role: "system", text: "🔍 Fetching preview..." }]);
     setExecuting(true);
 
     try {
-      // STEP 2: Execute with limit 5 for preview
-      const res = await fetch("/api/ai", {
+      // Execute with limit 5 for preview
+      const res = await fetch("/api/ai/execute", {
         method: "POST",
         body: JSON.stringify({ 
           uri, 
@@ -106,14 +116,20 @@ export default function ChatPage() {
         ? JSON.stringify(data.result, null, 2)
         : "No results found";
       
+      // Show projection info if available
+      let projectionInfo = "";
+      if (data.metadata?.projectionUsed && data.metadata?.fieldsReturned) {
+        projectionInfo = `📋 Showing fields: ${data.metadata.fieldsReturned.join(', ')}\n\n`;
+      }
+      
       setMessages((m) => [...m, {
-        role: "system",
-        text: `Preview (${resultCount} results):\n\n${resultText}`,
+        role: "preview",
+        text: `🔍 Preview (showing ${resultCount} of total results):\n\n${projectionInfo}${resultText}`,
       }]);
     } catch (err) {
       setMessages((m) => [...m, { 
         role: "error", 
-        text: `Preview failed: ${err.message}` 
+        text: `❌ Preview failed: ${err.message}` 
       }]);
     } finally {
       setExecuting(false);
@@ -130,11 +146,11 @@ export default function ChatPage() {
     setExecuting(true);
     setMessages((m) => [...m, { 
       role: "system", 
-      text: `Executing ${action.action}...` 
+      text: `⚙️ Executing ${action.action}...` 
     }]);
 
     try {
-      // STEP 2: Execute the query
+      // Execute the query
       const res = await fetch("/api/ai/execute", {
         method: "POST",
         body: JSON.stringify({ uri, action }),
@@ -158,18 +174,24 @@ export default function ChatPage() {
         
         // Show projection info if available
         if (data.metadata?.projectionUsed) {
-          resultText = `Showing fields: ${data.metadata.fieldsReturned.join(', ')}\n\n${resultText}`;
+          resultText = `📋 Showing fields: ${data.metadata.fieldsReturned.join(', ')}\n\n${resultText}`;
         }
         
-        resultText = `Found ${data.result.length} document(s)\n\n${resultText}`;
+        resultText = `✅ Found ${data.result.length} document(s)\n\n${resultText}`;
       } else {
         // Insert/Update/Delete results
         if (data.result.insertedCount !== undefined) {
           resultText = `✅ Inserted ${data.result.insertedCount} document(s)`;
+          if (data.result.insertedId) {
+            resultText += `\nID: ${data.result.insertedId}`;
+          }
         } else if (data.result.modifiedCount !== undefined) {
-          resultText = `✅ Modified ${data.result.modifiedCount} document(s) (matched ${data.result.matchedCount})`;
+          resultText = `✅ Modified ${data.result.modifiedCount} document(s)\n📊 Matched ${data.result.matchedCount} document(s)`;
         } else if (data.result.deletedCount !== undefined) {
           resultText = `✅ Deleted ${data.result.deletedCount} document(s)`;
+        } else if (data.result.total !== undefined) {
+          // Count result
+          resultText = `📊 Total count: ${data.result.total}`;
         } else {
           resultText = JSON.stringify(data.result, null, 2);
         }
@@ -182,7 +204,7 @@ export default function ChatPage() {
     } catch (err) {
       setMessages((m) => [...m, { 
         role: "error", 
-        text: `❌ Failed: ${err.message}` 
+        text: `❌ Execution failed: ${err.message}` 
       }]);
     } finally {
       setExecuting(false);
@@ -191,15 +213,17 @@ export default function ChatPage() {
 
   return (
     <div className="fixed inset-0 flex items-center justify-center p-4 sm:p-6 pointer-events-none">
-      {/* Centered Chat Container with Border */}
+      {/* Centered Chat Container */}
       <div className="w-full max-w-5xl h-[calc(100vh-3rem)] flex flex-col bg-black/20 backdrop-blur-md border border-neutral-800/50 rounded-2xl shadow-2xl overflow-hidden pointer-events-auto">
         
         {/* Header */}
         <div className="border-b border-neutral-800/50 bg-black/10">
           <div className="px-6 py-4 flex items-center justify-between">
             <div>
-              <h1 className="text-xl font-bold text-white">DB Agent</h1>
-              <p className="text-xs text-gray-400">Connected</p>
+              <h1 className="text-xl font-bold text-white">🤖 DB Agent</h1>
+              <p className="text-xs text-gray-400">
+                Connected • Powered by Ollama (qwen2.5-coder:7b)
+              </p>
             </div>
             <button
               onClick={() => { localStorage.removeItem("dbURI"); router.push("/connect"); }}
@@ -219,22 +243,28 @@ export default function ChatPage() {
                 // Empty State
                 <div className="flex flex-col items-center justify-center h-full w-full px-4 py-8">
                   <h2 className="text-4xl font-bold text-white mb-3">Ask Your Database</h2>
-                  <p className="text-gray-400 mb-8 max-w-md text-center text-base">
-                    Type natural language queries in English, Hindi, or Marathi
+                  <p className="text-gray-400 mb-2 max-w-md text-center text-base">
+                    Type queries in <span className="text-white font-semibold">English</span>, 
+                    <span className="text-white font-semibold"> Hindi (हिंदी)</span>, or 
+                    <span className="text-white font-semibold"> Marathi (मराठी)</span>
+                  </p>
+                  <p className="text-xs text-gray-500 mb-8">
+                    Using Ollama with Qwen 2.5 Coder (local, private, no API keys needed)
                   </p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
                     {[
-                      "Find all users", 
-                      "Ram naam ke user ka email batao",
-                      "show email of firstname Ram", 
-                      "Count all users"
-                    ].map((q) => (
+                      { en: "Find all users", hi: "सभी users दिखाओ" },
+                      { en: "Show Ram's email", hi: "Ram का email बताओ" },
+                      { en: "Count all users", hi: "सभी users गिनो" },
+                      { en: "List all emails", hi: "सर्व emails दाखव" }
+                    ].map((q, i) => (
                       <button
-                        key={q}
-                        onClick={() => setInput(q)}
-                        className="px-4 py-3 rounded-lg bg-black/20 backdrop-blur-md hover:bg-black/30 border border-neutral-700/30 text-gray-300 hover:text-white transition text-sm font-medium"
+                        key={i}
+                        onClick={() => setInput(q.en)}
+                        className="px-4 py-3 rounded-lg bg-black/20 backdrop-blur-md hover:bg-black/30 border border-neutral-700/30 text-gray-300 hover:text-white transition text-sm font-medium text-left"
                       >
-                        {q}
+                        <div className="font-semibold">{q.en}</div>
+                        <div className="text-xs text-gray-500 mt-1">{q.hi}</div>
                       </button>
                     ))}
                   </div>
@@ -251,6 +281,8 @@ export default function ChatPage() {
                           ? "bg-red-500/10 backdrop-blur-md text-red-400 border border-red-500/30"
                           : m.role === "success"
                           ? "bg-green-500/10 backdrop-blur-md text-green-400 border border-green-500/30"
+                          : m.role === "preview"
+                          ? "bg-blue-500/10 backdrop-blur-md text-blue-400 border border-blue-500/30"
                           : "bg-black/30 backdrop-blur-md text-gray-300 border border-neutral-700/30"
                       }`}>
                         <p className="whitespace-pre-wrap break-words font-light font-mono">{m.text}</p>
@@ -258,23 +290,26 @@ export default function ChatPage() {
                           <div className="mt-3 flex gap-2 flex-wrap">
                             <button
                               onClick={() => previewAction(m.action)}
-                              disabled={executing}
-                              className="px-2.5 py-1 text-xs rounded bg-black/40 backdrop-blur-md hover:bg-black/50 text-gray-300 hover:text-white border border-neutral-700/30 disabled:opacity-50 transition"
+                              disabled={executing || m.action.action !== "find"}
+                              className="px-2.5 py-1 text-xs rounded bg-blue-500/20 backdrop-blur-md hover:bg-blue-500/30 text-blue-300 hover:text-blue-200 border border-blue-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition"
                             >
-                              Preview
+                              🔍 Preview
                             </button>
                             <button
                               onClick={() => runAction(m.action)}
                               disabled={executing}
-                              className="px-2.5 py-1 text-xs rounded bg-black/40 backdrop-blur-md hover:bg-black/50 text-gray-300 hover:text-white border border-neutral-700/30 disabled:opacity-50 transition"
+                              className="px-2.5 py-1 text-xs rounded bg-green-500/20 backdrop-blur-md hover:bg-green-500/30 text-green-300 hover:text-green-200 border border-green-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition"
                             >
-                              Execute
+                              ▶️ Execute
                             </button>
                             <button
-                              onClick={() => navigator.clipboard.writeText(JSON.stringify(m.action, null, 2))}
+                              onClick={() => {
+                                navigator.clipboard.writeText(JSON.stringify(m.action, null, 2));
+                                alert("✅ Query copied to clipboard!");
+                              }}
                               className="px-2.5 py-1 text-xs rounded bg-black/40 backdrop-blur-md hover:bg-black/50 text-gray-300 hover:text-white border border-neutral-700/30 transition"
                             >
-                              Copy
+                              📋 Copy
                             </button>
                           </div>
                         )}
@@ -296,7 +331,7 @@ export default function ChatPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyPress={(e) => e.key === "Enter" && !loading && !executing && send()}
-                  placeholder="Ask in English, Hindi, or Marathi..."
+                  placeholder="Ask in English, Hindi (हिंदी), or Marathi (मराठी)..."
                   className="flex-1 px-4 py-3 rounded-lg bg-black/20 backdrop-blur-md border border-neutral-700/30 hover:border-neutral-600/30 text-white placeholder-gray-500 focus:outline-none focus:border-white/50 focus:ring-1 focus:ring-white/20 transition text-sm disabled:opacity-50"
                   disabled={loading || executing}
                 />
@@ -305,11 +340,11 @@ export default function ChatPage() {
                   disabled={loading || executing || !input.trim()}
                   className="px-6 py-3 rounded-lg bg-white text-black font-semibold hover:bg-gray-100 disabled:bg-gray-700 disabled:text-gray-400 transition disabled:cursor-not-allowed text-sm"
                 >
-                  {loading ? "..." : "Send"}
+                  {loading ? "⏳" : "Send"}
                 </button>
               </div>
               <p className="text-xs text-gray-500 mt-2">
-                Press Enter to send • Try: "Ram ka email batao" or "show all users"
+                💡 Press Enter to send • Try: "Ram का email बताओ" • Powered by local Ollama
               </p>
             </div>
           </div>

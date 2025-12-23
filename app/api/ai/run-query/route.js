@@ -1,101 +1,26 @@
-// app/api/ai/run-query/route.js
+// ============================================================================
+// app/api/ai/run-query/route.js - Enhanced with DB Introspection Engine
+// ============================================================================
+
 import { NextResponse } from "next/server";
 import { parseUserInstruction } from "@/lib/ai";
 import { logStep, validateAction } from "@/lib/debug";
-import { MongoClient } from "mongodb";
+import { getCachedDBMetadata } from "@/lib/dbintrospect";
 
-// Helper function to get collection schema
-async function getCollectionSchema(uri, collectionName) {
-  let client;
-  try {
-    client = await MongoClient.connect(uri);
-    const db = client.db();
-    
-    // Get sample documents to infer schema (increased to 20 for better coverage)
-    const samples = await db.collection(collectionName)
-      .find()
-      .limit(20)
-      .toArray();
-    
-    if (samples.length === 0) {
-      return { fields: [], sampleDocument: null };
-    }
-    
-    // Extract all unique fields
-    const fieldsSet = new Set();
-    samples.forEach(doc => {
-      Object.keys(doc).forEach(key => fieldsSet.add(key));
-    });
-    
-    // Build schema with types
-    const schema = {};
-    const fields = Array.from(fieldsSet);
-    
-    fields.forEach(field => {
-      const sampleValue = samples[0][field];
-      schema[field] = typeof sampleValue;
-    });
-    
-    return {
-      fields,
-      schema,
-      sampleDocument: samples[0]
-    };
-  } catch (error) {
-    console.error(`Error getting schema for ${collectionName}:`, error.message);
-    return { fields: [], schema: {}, sampleDocument: null };
-  } finally {
-    if (client) await client.close();
-  }
-}
-
-// Get schemas for all collections
-async function getAllSchemas(uri, collectionNames) {
-  const schemas = {};
-  
-  // If no collections specified, fetch all collections
-  if (collectionNames.length === 0) {
-    let client;
-    try {
-      client = await MongoClient.connect(uri);
-      const db = client.db();
-      const collections = await db.listCollections().toArray();
-      collectionNames = collections
-        .map(col => col.name)
-        .filter(name => !name.startsWith('system.')); // Filter out system collections
-    } catch (error) {
-      console.error('Error listing collections:', error);
-      return {};
-    } finally {
-      if (client) await client.close();
-    }
-  }
-  
-  // Fetch schemas in parallel for better performance
-  const schemaPromises = collectionNames.map(async (collectionName) => {
-    const schema = await getCollectionSchema(uri, collectionName);
-    return [collectionName, schema];
-  });
-  
-  const schemaEntries = await Promise.all(schemaPromises);
-  schemaEntries.forEach(([name, schema]) => {
-    schemas[name] = schema;
-  });
-  
-  return schemas;
-}
-
+// ============================================================================
+// Main POST Handler
+// ============================================================================
 export async function POST(req) {
   const requestId = Math.random().toString(36).slice(2, 8);
   
   try {
-    logStep(`[${requestId}] REQUEST RECEIVED`, { timestamp: new Date().toISOString() });
+    logStep(`[${requestId}] 📥 REQUEST RECEIVED`, { timestamp: new Date().toISOString() });
 
     // Parse request body
     const body = await req.json();
     const { dbType = "mongodb", userText, collections = [], previewLimit = 50, uri } = body || {};
 
-    logStep(`[${requestId}] BODY PARSED`, { 
+    logStep(`[${requestId}] 📋 REQUEST DETAILS`, { 
       dbType, 
       userText, 
       collectionsCount: collections.length, 
@@ -104,12 +29,12 @@ export async function POST(req) {
     });
 
     // ========================================================================
-    // ✅ REMOVED API KEY CHECK - Ollama doesn't need API keys!
+    // ✅ NO API KEY NEEDED - Using Ollama locally!
     // ========================================================================
 
     // Validate input
     if (!userText || userText.trim().length === 0) {
-      logStep(`[${requestId}] INVALID INPUT`, { userText });
+      logStep(`[${requestId}] ❌ INVALID INPUT`, { userText });
       return NextResponse.json({ 
         ok: false, 
         error: "userText is required and cannot be empty" 
@@ -119,82 +44,206 @@ export async function POST(req) {
     // Get database URI from request
     const dbUri = uri || body.dbURI;
     
-    // Fetch schemas for all collections (or auto-detect if none provided)
+    // ========================================================================
+    // ✅ NEW: Use Introspection Engine (Cached, Optimized)
+    // ========================================================================
     let collectionSchemas = {};
+    let dbMetadata = null;
+    
     if (dbUri) {
-      logStep(`[${requestId}] FETCHING SCHEMAS`, { 
+      logStep(`[${requestId}] 🔍 FETCHING DATABASE METADATA (Introspection Engine)`, { 
         collectionsProvided: collections.length,
-        willAutoDetect: collections.length === 0 
+        cacheEnabled: true
       });
       
       try {
-        collectionSchemas = await getAllSchemas(dbUri, collections);
-        logStep(`[${requestId}] SCHEMAS FETCHED`, { 
-          collections: Object.keys(collectionSchemas),
-          details: Object.entries(collectionSchemas).map(([name, schema]) => ({
-            collection: name,
-            fieldCount: schema.fields?.length || 0,
-            fields: schema.fields?.slice(0, 10) // Show first 10 fields in logs
-          }))
+        // Get cached metadata (or scan if needed)
+        dbMetadata = await getCachedDBMetadata(dbUri, false);
+        
+        // Build collection schemas map from metadata
+        dbMetadata.collections.forEach(col => {
+          collectionSchemas[col.name] = {
+            fields: col.fields,
+            fieldTypes: col.fieldTypes,
+            sampleValues: col.sampleValues,
+            documentCount: col.documentCount,
+            indexes: col.indexes
+          };
+        });
+        
+        const schemaDetails = Object.entries(collectionSchemas).map(([name, schema]) => ({
+          collection: name,
+          fieldCount: schema.fields?.length || 0,
+          fields: schema.fields || [],
+          documentCount: schema.documentCount || 0,
+          indexes: schema.indexes?.length || 0
+        }));
+        
+        logStep(`[${requestId}] ✅ METADATA LOADED`, { 
+          totalCollections: Object.keys(collectionSchemas).length,
+          totalDocuments: dbMetadata.totalDocuments,
+          scannedAt: dbMetadata.scannedAt,
+          fromCache: true,
+          details: schemaDetails
         });
       } catch (schemaError) {
-        logStep(`[${requestId}] SCHEMA FETCH FAILED`, { error: schemaError.message });
-        // Continue without schemas - AI will work with less context
+        logStep(`[${requestId}] ⚠️ INTROSPECTION FAILED`, { 
+          error: schemaError.message,
+          note: "AI will work without schema context - accuracy may be reduced"
+        });
+        // Continue without schemas - AI will still work but with less context
       }
     } else {
-      logStep(`[${requestId}] NO URI PROVIDED`, { note: "AI will work without schema context" });
+      logStep(`[${requestId}] ⚠️ NO DATABASE URI`, { 
+        note: "AI will work without schema context - may be less accurate" 
+      });
     }
 
-    logStep(`[${requestId}] CALLING OLLAMA AI`, { 
+    // Prepare collections list for AI
+    const collectionsForAI = Object.keys(collectionSchemas).length > 0 
+      ? Object.keys(collectionSchemas) 
+      : collections;
+
+    logStep(`[${requestId}] 🤖 CALLING OLLAMA AI`, { 
       userText, 
       hasSchemas: Object.keys(collectionSchemas).length > 0,
-      schemaCollections: Object.keys(collectionSchemas)
+      collections: collectionsForAI,
+      schemasAvailable: Object.keys(collectionSchemas),
+      model: "qwen2.5-coder:7b"
     });
 
-    // Call Ollama AI with schema context
+    // Call Ollama AI with rich schema context from introspection engine
     const action = await parseUserInstruction({ 
       dbType, 
       userText, 
-      collections: Object.keys(collectionSchemas).length > 0 ? Object.keys(collectionSchemas) : collections, 
+      collections: collectionsForAI, 
       previewLimit,
-      collectionSchemas // Pass schemas to AI
+      collectionSchemas // Rich schema with types, examples, indexes
     });
 
-    logStep(`[${requestId}] OLLAMA RESPONSE RECEIVED`, action);
+    logStep(`[${requestId}] ✅ OLLAMA RESPONSE PARSED`, {
+      action: action.action,
+      collection: action.collection,
+      hasQuery: !!action.query,
+      hasProjection: !!(action.options?.projection),
+      queryFields: Object.keys(action.query || {}),
+      projectionFields: Object.keys(action.options?.projection || {})
+    });
 
-    // Validate parsed action
+    // Validate parsed action structure
     const validation = validateAction(action);
     if (!validation.valid) {
-      logStep(`[${requestId}] ACTION VALIDATION FAILED`, validation.errors);
+      logStep(`[${requestId}] ❌ ACTION VALIDATION FAILED`, validation.errors);
       return NextResponse.json(
-        { ok: false, error: `Invalid action: ${validation.errors.join("; ")}` },
+        { 
+          ok: false, 
+          error: `Invalid query structure: ${validation.errors.join("; ")}`,
+          action 
+        },
         { status: 400 }
       );
     }
 
-    logStep(`[${requestId}] ACTION VALIDATED`, { 
+    // ========================================================================
+    // ✅ NEW: Validate fields against schema (if available)
+    // ========================================================================
+    if (collectionSchemas[action.collection]) {
+      const availableFields = collectionSchemas[action.collection].fields;
+      const queryFields = Object.keys(action.query || {});
+      const projectionFields = Object.keys(action.options?.projection || {});
+      
+      // Check query fields
+      const invalidQueryFields = queryFields.filter(field => {
+        // Skip MongoDB operators like $or, $and
+        if (field.startsWith('$')) return false;
+        return !availableFields.includes(field);
+      });
+      
+      // Check projection fields
+      const invalidProjectionFields = projectionFields.filter(field => 
+        field !== '_id' && !availableFields.includes(field)
+      );
+      
+      if (invalidQueryFields.length > 0 || invalidProjectionFields.length > 0) {
+        const errorMsg = [];
+        
+        if (invalidQueryFields.length > 0) {
+          errorMsg.push(`Query uses non-existent fields: ${invalidQueryFields.join(', ')}`);
+        }
+        
+        if (invalidProjectionFields.length > 0) {
+          errorMsg.push(`Projection uses non-existent fields: ${invalidProjectionFields.join(', ')}`);
+        }
+        
+        errorMsg.push(`Available fields: ${availableFields.join(', ')}`);
+        
+        logStep(`[${requestId}] ⚠️ FIELD VALIDATION WARNING`, {
+          invalidQueryFields,
+          invalidProjectionFields,
+          availableFields,
+          note: "Query may fail or return unexpected results"
+        });
+        
+        // Log warning but don't block - let MongoDB handle it
+        // This helps catch AI mistakes while allowing valid MongoDB operators
+      }
+    }
+
+    logStep(`[${requestId}] ✅ ACTION VALIDATED SUCCESSFULLY`, { 
       action: action.action,
       collection: action.collection,
-      hasProjection: !!(action.options?.projection)
+      queryFields: Object.keys(action.query || {}),
+      projectionFields: Object.keys(action.options?.projection || {})
     });
 
+    // Success response with enhanced metadata
     return NextResponse.json({ 
       ok: true, 
       action, 
       requestId,
-      schemaUsed: Object.keys(collectionSchemas).length > 0
+      metadata: {
+        schemaUsed: Object.keys(collectionSchemas).length > 0,
+        collectionsAvailable: collectionsForAI,
+        totalDocuments: dbMetadata?.totalDocuments || 0,
+        scannedAt: dbMetadata?.scannedAt || null,
+        model: "qwen2.5-coder:7b",
+        provider: "Ollama (local)",
+        introspectionEngine: "v1.0 (cached)",
+        // Field information for the target collection
+        targetCollectionInfo: collectionSchemas[action.collection] ? {
+          fields: collectionSchemas[action.collection].fields,
+          documentCount: collectionSchemas[action.collection].documentCount,
+          indexes: collectionSchemas[action.collection].indexes?.length || 0
+        } : null
+      }
     });
+    
   } catch (error) {
-    logStep(`[${requestId}] FATAL ERROR`, { 
+    logStep(`[${requestId}] 💥 FATAL ERROR`, { 
       error: error.message, 
       stack: error.stack 
     }, error);
     
+    // Provide helpful error messages based on error type
+    let userMessage = error.message;
+    
+    if (error.message.includes("Ollama is not running")) {
+      userMessage = "🔴 Ollama is not running. Please start it with: ollama serve";
+    } else if (error.message.includes("Failed to parse")) {
+      userMessage = "🔴 AI response was invalid. Try rephrasing your query.";
+    } else if (error.message.includes("connect")) {
+      userMessage = "🔴 Cannot connect to database or Ollama. Check your connections.";
+    } else if (error.message.includes("introspect") || error.message.includes("schema")) {
+      userMessage = "🔴 Database introspection failed. Query will work but may be less accurate.";
+    }
+    
     return NextResponse.json(
       { 
         ok: false, 
-        error: error.message || "Something went wrong parsing your request",
-        requestId 
+        error: userMessage,
+        details: error.message,
+        requestId,
+        help: "Make sure Ollama is running: ollama serve"
       },
       { status: 500 }
     );
