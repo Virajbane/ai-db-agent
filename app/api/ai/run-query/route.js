@@ -1,36 +1,21 @@
 // ============================================================================
-// app/api/ai/run-query/route.js - Enhanced with DB Introspection Engine
+// app/api/ai/run-query/route.js - Universal Query Parser with Multi-DB Support
 // ============================================================================
 
 import { NextResponse } from "next/server";
-import { parseUserInstruction } from "@/lib/ai";
+import { parseUniversalInstruction } from "@/lib/universalAi";
+import { getCachedUniversalMetadata } from "@/lib/multiDbIntrospect";
+import { detectDatabaseType } from "@/lib/dbAdapters";
 import { logStep, validateAction } from "@/lib/debug";
-import { getCachedDBMetadata } from "@/lib/dbintrospect";
 
-// ============================================================================
-// Main POST Handler
-// ============================================================================
 export async function POST(req) {
   const requestId = Math.random().toString(36).slice(2, 8);
   
   try {
     logStep(`[${requestId}] 📥 REQUEST RECEIVED`, { timestamp: new Date().toISOString() });
 
-    // Parse request body
     const body = await req.json();
-    const { dbType = "mongodb", userText, collections = [], previewLimit = 50, uri } = body || {};
-
-    logStep(`[${requestId}] 📋 REQUEST DETAILS`, { 
-      dbType, 
-      userText, 
-      collectionsCount: collections.length, 
-      previewLimit,
-      hasUri: !!uri 
-    });
-
-    // ========================================================================
-    // ✅ NO API KEY NEEDED - Using Ollama locally!
-    // ========================================================================
+    const { userText, collections = [], previewLimit = 50, uri } = body || {};
 
     // Validate input
     if (!userText || userText.trim().length === 0) {
@@ -41,96 +26,107 @@ export async function POST(req) {
       }, { status: 400 });
     }
 
-    // Get database URI from request
-    const dbUri = uri || body.dbURI;
+    if (!uri) {
+      logStep(`[${requestId}] ❌ MISSING URI`);
+      return NextResponse.json({ 
+        ok: false, 
+        error: "Database connection string is required" 
+      }, { status: 400 });
+    }
+
+    // Detect database type
+    const dbType = detectDatabaseType(uri);
     
+    if (!dbType) {
+      return NextResponse.json({ 
+        ok: false, 
+        error: "Unsupported database type. Supported: MongoDB, PostgreSQL, MySQL, Redis, Supabase" 
+      }, { status: 400 });
+    }
+
+    logStep(`[${requestId}] 📋 REQUEST DETAILS`, { 
+      dbType,
+      userText, 
+      collectionsCount: collections.length, 
+      previewLimit
+    });
+
     // ========================================================================
-    // ✅ NEW: Use Introspection Engine (Cached, Optimized)
+    // Fetch universal database metadata
     // ========================================================================
     let collectionSchemas = {};
     let dbMetadata = null;
     
-    if (dbUri) {
-      logStep(`[${requestId}] 🔍 FETCHING DATABASE METADATA (Introspection Engine)`, { 
+    try {
+      logStep(`[${requestId}] 🔍 FETCHING ${dbType.toUpperCase()} METADATA`, { 
         collectionsProvided: collections.length,
         cacheEnabled: true
       });
       
-      try {
-        // Get cached metadata (or scan if needed)
-        dbMetadata = await getCachedDBMetadata(dbUri, false);
-        
-        // Build collection schemas map from metadata
-        dbMetadata.collections.forEach(col => {
-          collectionSchemas[col.name] = {
-            fields: col.fields,
-            fieldTypes: col.fieldTypes,
-            sampleValues: col.sampleValues,
-            documentCount: col.documentCount,
-            indexes: col.indexes
-          };
-        });
-        
-        const schemaDetails = Object.entries(collectionSchemas).map(([name, schema]) => ({
-          collection: name,
-          fieldCount: schema.fields?.length || 0,
-          fields: schema.fields || [],
-          documentCount: schema.documentCount || 0,
-          indexes: schema.indexes?.length || 0
-        }));
-        
-        logStep(`[${requestId}] ✅ METADATA LOADED`, { 
-          totalCollections: Object.keys(collectionSchemas).length,
-          totalDocuments: dbMetadata.totalDocuments,
-          scannedAt: dbMetadata.scannedAt,
-          fromCache: true,
-          details: schemaDetails
-        });
-      } catch (schemaError) {
-        logStep(`[${requestId}] ⚠️ INTROSPECTION FAILED`, { 
-          error: schemaError.message,
-          note: "AI will work without schema context - accuracy may be reduced"
-        });
-        // Continue without schemas - AI will still work but with less context
-      }
-    } else {
-      logStep(`[${requestId}] ⚠️ NO DATABASE URI`, { 
-        note: "AI will work without schema context - may be less accurate" 
+      dbMetadata = await getCachedUniversalMetadata(uri, false);
+      
+      // Build collection schemas map
+      dbMetadata.collections.forEach(col => {
+        collectionSchemas[col.name] = {
+          fields: col.fields,
+          fieldTypes: col.fieldTypes,
+          sampleValues: col.sampleValues,
+          documentCount: col.documentCount,
+          indexes: col.indexes
+        };
+      });
+      
+      const schemaDetails = Object.entries(collectionSchemas).map(([name, schema]) => ({
+        name,
+        fieldCount: schema.fields?.length || 0,
+        fields: schema.fields || [],
+        documentCount: schema.documentCount || 0
+      }));
+      
+      logStep(`[${requestId}] ✅ METADATA LOADED`, { 
+        totalCollections: Object.keys(collectionSchemas).length,
+        totalDocuments: dbMetadata.totalDocuments,
+        scannedAt: dbMetadata.scannedAt,
+        fromCache: true,
+        details: schemaDetails
+      });
+    } catch (schemaError) {
+      logStep(`[${requestId}] ⚠️ INTROSPECTION FAILED`, { 
+        error: schemaError.message,
+        note: "AI will work without schema context"
       });
     }
 
-    // Prepare collections list for AI
+    // Prepare collections list
     const collectionsForAI = Object.keys(collectionSchemas).length > 0 
       ? Object.keys(collectionSchemas) 
       : collections;
 
     logStep(`[${requestId}] 🤖 CALLING OLLAMA AI`, { 
       userText, 
+      dbType,
       hasSchemas: Object.keys(collectionSchemas).length > 0,
       collections: collectionsForAI,
-      schemasAvailable: Object.keys(collectionSchemas),
       model: "qwen2.5-coder:7b"
     });
 
-    // Call Ollama AI with rich schema context from introspection engine
-    const action = await parseUserInstruction({ 
-      dbType, 
+    // Call Ollama AI with database-specific context
+    const action = await parseUniversalInstruction({ 
+      dbType,
       userText, 
       collections: collectionsForAI, 
       previewLimit,
-      collectionSchemas // Rich schema with types, examples, indexes
+      collectionSchemas
     });
 
     logStep(`[${requestId}] ✅ OLLAMA RESPONSE PARSED`, {
       action: action.action,
-      collection: action.collection,
-      hasQuery: !!action.query,
-      hasProjection: !!(action.options?.projection),
-      queryFields: Object.keys(action.query || {}),
-      projectionFields: Object.keys(action.options?.projection || {})
+      target: action.collection || action.table,
+      hasQuery: !!(action.query || action.where),
+      dbType
     });
 
-    // Validate parsed action structure
+    // Validate parsed action
     const validation = validateAction(action);
     if (!validation.valid) {
       logStep(`[${requestId}] ❌ ACTION VALIDATION FAILED`, validation.errors);
@@ -145,76 +141,46 @@ export async function POST(req) {
     }
 
     // ========================================================================
-    // ✅ NEW: Validate fields against schema (if available)
+    // Validate fields against schema (if available)
     // ========================================================================
-    if (collectionSchemas[action.collection]) {
-      const availableFields = collectionSchemas[action.collection].fields;
-      const queryFields = Object.keys(action.query || {});
-      const projectionFields = Object.keys(action.options?.projection || {});
+    const targetName = action.collection || action.table;
+    if (collectionSchemas[targetName]) {
+      const availableFields = collectionSchemas[targetName].fields;
+      const queryFields = Object.keys(action.query || action.where || {});
       
-      // Check query fields
-      const invalidQueryFields = queryFields.filter(field => {
-        // Skip MongoDB operators like $or, $and
-        if (field.startsWith('$')) return false;
+      const invalidFields = queryFields.filter(field => {
+        if (field.startsWith('$')) return false; // MongoDB operators
         return !availableFields.includes(field);
       });
       
-      // Check projection fields
-      const invalidProjectionFields = projectionFields.filter(field => 
-        field !== '_id' && !availableFields.includes(field)
-      );
-      
-      if (invalidQueryFields.length > 0 || invalidProjectionFields.length > 0) {
-        const errorMsg = [];
-        
-        if (invalidQueryFields.length > 0) {
-          errorMsg.push(`Query uses non-existent fields: ${invalidQueryFields.join(', ')}`);
-        }
-        
-        if (invalidProjectionFields.length > 0) {
-          errorMsg.push(`Projection uses non-existent fields: ${invalidProjectionFields.join(', ')}`);
-        }
-        
-        errorMsg.push(`Available fields: ${availableFields.join(', ')}`);
-        
+      if (invalidFields.length > 0) {
         logStep(`[${requestId}] ⚠️ FIELD VALIDATION WARNING`, {
-          invalidQueryFields,
-          invalidProjectionFields,
+          invalidFields,
           availableFields,
           note: "Query may fail or return unexpected results"
         });
-        
-        // Log warning but don't block - let MongoDB handle it
-        // This helps catch AI mistakes while allowing valid MongoDB operators
       }
     }
 
     logStep(`[${requestId}] ✅ ACTION VALIDATED SUCCESSFULLY`, { 
       action: action.action,
-      collection: action.collection,
-      queryFields: Object.keys(action.query || {}),
-      projectionFields: Object.keys(action.options?.projection || {})
+      target: action.collection || action.table
     });
 
-    // Success response with enhanced metadata
+    // Success response
     return NextResponse.json({ 
       ok: true, 
       action, 
       requestId,
       metadata: {
+        dbType,
         schemaUsed: Object.keys(collectionSchemas).length > 0,
         collectionsAvailable: collectionsForAI,
         totalDocuments: dbMetadata?.totalDocuments || 0,
         scannedAt: dbMetadata?.scannedAt || null,
         model: "qwen2.5-coder:7b",
         provider: "Ollama (local)",
-        introspectionEngine: "v1.0 (cached)",
-        // Field information for the target collection
-        targetCollectionInfo: collectionSchemas[action.collection] ? {
-          fields: collectionSchemas[action.collection].fields,
-          documentCount: collectionSchemas[action.collection].documentCount,
-          indexes: collectionSchemas[action.collection].indexes?.length || 0
-        } : null
+        introspectionEngine: "universal-v1.0"
       }
     });
     
@@ -224,7 +190,6 @@ export async function POST(req) {
       stack: error.stack 
     }, error);
     
-    // Provide helpful error messages based on error type
     let userMessage = error.message;
     
     if (error.message.includes("Ollama is not running")) {
@@ -233,8 +198,6 @@ export async function POST(req) {
       userMessage = "🔴 AI response was invalid. Try rephrasing your query.";
     } else if (error.message.includes("connect")) {
       userMessage = "🔴 Cannot connect to database or Ollama. Check your connections.";
-    } else if (error.message.includes("introspect") || error.message.includes("schema")) {
-      userMessage = "🔴 Database introspection failed. Query will work but may be less accurate.";
     }
     
     return NextResponse.json(
@@ -242,8 +205,7 @@ export async function POST(req) {
         ok: false, 
         error: userMessage,
         details: error.message,
-        requestId,
-        help: "Make sure Ollama is running: ollama serve"
+        requestId
       },
       { status: 500 }
     );

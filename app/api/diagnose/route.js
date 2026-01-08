@@ -1,3 +1,4 @@
+// app/api/diagnose/route.js
 import { NextResponse } from "next/server";
 
 /**

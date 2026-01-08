@@ -1,6 +1,10 @@
-// app/api/ai/execute/route.js
-import { getNativeMongoClient } from "@/lib/db";
+// ============================================================================
+// app/api/ai/execute/route.js - Universal Query Execution Engine
+// ============================================================================
+
+import { getUniversalClient } from "@/lib/db";
 import { logStep, validateAction } from "@/lib/debug";
+import { detectDatabaseType } from "@/lib/dbAdapters";
 
 export async function POST(req) {
   const requestId = Math.random().toString(36).slice(2, 8);
@@ -14,34 +18,60 @@ export async function POST(req) {
     // Validate inputs
     if (!uri) {
       logStep(`[${requestId}] MISSING URI`, {});
-      return new Response(JSON.stringify({ ok: false, error: "MongoDB URI required" }), { status: 400 });
+      return new Response(
+        JSON.stringify({ ok: false, error: "Database URI required" }), 
+        { status: 400 }
+      );
     }
 
     if (!action) {
       logStep(`[${requestId}] MISSING ACTION`, {});
-      return new Response(JSON.stringify({ ok: false, error: "Action object required" }), { status: 400 });
+      return new Response(
+        JSON.stringify({ ok: false, error: "Action object required" }), 
+        { status: 400 }
+      );
     }
 
-    logStep(`[${requestId}] INPUTS VALIDATED`, { actionType: action.action, collection: action.collection });
+    // Detect database type
+    const dbType = detectDatabaseType(uri);
+    
+    if (!dbType) {
+      logStep(`[${requestId}] UNSUPPORTED DATABASE TYPE`, {});
+      return new Response(
+        JSON.stringify({ 
+          ok: false, 
+          error: "Unsupported database type. Supported: MongoDB, PostgreSQL, MySQL, Redis, Supabase" 
+        }), 
+        { status: 400 }
+      );
+    }
+
+    logStep(`[${requestId}] INPUTS VALIDATED`, { 
+      dbType,
+      actionType: action.action, 
+      target: action.collection || action.table || action.key
+    });
 
     // Validate action structure
     const validation = validateAction(action);
     if (!validation.valid) {
       logStep(`[${requestId}] ACTION VALIDATION FAILED`, validation.errors);
-      return new Response(JSON.stringify({ ok: false, error: validation.errors.join("; ") }), { status: 400 });
+      return new Response(
+        JSON.stringify({ ok: false, error: validation.errors.join("; ") }), 
+        { status: 400 }
+      );
     }
 
     // ========================================================================
-    // ✅ NEW: Validate sort values (must be 1 or -1)
+    // MongoDB-specific validation (sort values must be 1 or -1)
     // ========================================================================
-    if (action.options && action.options.sort) {
+    if (dbType === 'mongodb' && action.options?.sort) {
       const sortObj = action.options.sort;
       const invalidSorts = Object.entries(sortObj).filter(([field, value]) => {
         return value !== 1 && value !== -1;
       });
       
       if (invalidSorts.length > 0) {
-        const errorMsg = `Invalid sort direction(s): ${invalidSorts.map(([f, v]) => `${f}=${v}`).join(', ')}. Must be 1 (ascending) or -1 (descending).`;
         logStep(`[${requestId}] INVALID SORT VALUES`, { invalidSorts, sortObj });
         
         // Auto-fix: Convert invalid values to 1
@@ -54,97 +84,55 @@ export async function POST(req) {
       }
     }
 
-    logStep(`[${requestId}] CONNECTING TO MONGODB`);
+    logStep(`[${requestId}] CONNECTING TO ${dbType.toUpperCase()}`);
 
-    // Connect to MongoDB
-    client = await getNativeMongoClient(uri);
-    logStep(`[${requestId}] CONNECTED TO MONGODB`);
+    // Get universal database client
+    client = await getUniversalClient(uri);
 
-    const db = client.db();
-    const col = db.collection(action.collection);
+    logStep(`[${requestId}] CONNECTED TO ${dbType.toUpperCase()}`);
 
     logStep(`[${requestId}] EXECUTING ${action.action.toUpperCase()}`, {
-      collection: action.collection,
-      query: action.query,
-      options: action.options,
+      dbType,
+      target: action.collection || action.table || action.key,
+      action: action
     });
 
-    let result;
-    let resultMetadata = {
-      action: action.action,
-      collection: action.collection,
-      projectionUsed: false,
-      fieldsReturned: []
-    };
+    // ========================================================================
+    // Execute query using database adapter
+    // ========================================================================
+    const result = await client.adapter.execute(action);
 
-    if (action.action === "find") {
-      const limit = (action.options && action.options.limit) || 100;
-      const sort = (action.options && action.options.sort) || {};
-      const skip = (action.options && action.options.skip) || 0;
-      const projection = (action.options && action.options.projection) || null;
-      
-      // Build find query
-      let cursor = col.find(action.query || {});
-      
-      // Apply skip if specified
-      if (skip > 0) {
-        cursor = cursor.skip(skip);
-        resultMetadata.skipped = skip;
-      }
-      
-      // Apply projection if specified
-      if (projection && Object.keys(projection).length > 0) {
-        cursor = cursor.project(projection);
-        resultMetadata.projectionUsed = true;
-        resultMetadata.fieldsReturned = Object.keys(projection).filter(k => projection[k] === 1);
-      }
-      
-      result = await cursor.sort(sort).limit(limit).toArray();
-      
-      logStep(`[${requestId}] FIND COMPLETE`, { 
-        documentCount: result.length,
-        skipped: skip,
-        projectionUsed: resultMetadata.projectionUsed,
-        fieldsReturned: resultMetadata.fieldsReturned
-      });
-    } 
-    else if (action.action === "aggregate") {
-      const pipeline = action.pipeline || [];
-      result = await col.aggregate(pipeline).toArray();
-      logStep(`[${requestId}] AGGREGATE COMPLETE`, { documentCount: result.length });
-    } 
-    else if (action.action === "insert") {
-      const payload = Array.isArray(action.insert) ? action.insert : [action.insert];
-      const res = await col.insertMany(payload);
-      result = { insertedIds: res.insertedIds, insertedCount: res.insertedCount };
-      logStep(`[${requestId}] INSERT COMPLETE`, result);
-    } 
-    else if (action.action === "update") {
-      const query = action.query || {};
-      const updateDoc = action.update || {};
-      const res = await col.updateMany(query, updateDoc);
-      result = { matchedCount: res.matchedCount, modifiedCount: res.modifiedCount, upsertedCount: res.upsertedCount };
-      logStep(`[${requestId}] UPDATE COMPLETE`, result);
-    } 
-    else if (action.action === "delete") {
-      const query = action.query || {};
-      
-      // Safety check - prevent full collection deletes
-      if (!query || Object.keys(query).length === 0) {
-        throw new Error("Delete operation requires a query condition. Cannot delete entire collection.");
-      }
-      
-      const res = await col.deleteMany(query);
-      result = { deletedCount: res.deletedCount };
-      logStep(`[${requestId}] DELETE COMPLETE`, result);
-    } 
-    else {
-      throw new Error(`Unsupported action: ${action.action}`);
-    }
+    logStep(`[${requestId}] EXECUTION COMPLETE`, { 
+      dbType,
+      resultType: typeof result,
+      hasResults: Array.isArray(result) ? result.length : 'N/A'
+    });
 
     // Close connection
     await client.close();
     logStep(`[${requestId}] CONNECTION CLOSED`);
+
+    // Build metadata based on result
+    let resultMetadata = {
+      action: action.action,
+      target: action.collection || action.table || action.key,
+      dbType: dbType,
+      projectionUsed: false,
+      fieldsReturned: []
+    };
+
+    // MongoDB-specific metadata
+    if (dbType === 'mongodb' && action.options?.projection) {
+      resultMetadata.projectionUsed = true;
+      resultMetadata.fieldsReturned = Object.keys(action.options.projection)
+        .filter(k => action.options.projection[k] === 1);
+    }
+
+    // SQL-specific metadata
+    if ((dbType === 'postgresql' || dbType === 'mysql' || dbType === 'supabase') && action.fields) {
+      resultMetadata.projectionUsed = true;
+      resultMetadata.fieldsReturned = action.fields;
+    }
 
     return new Response(
       JSON.stringify({ 
@@ -157,7 +145,10 @@ export async function POST(req) {
     );
   } 
   catch (err) {
-    logStep(`[${requestId}] EXECUTION FAILED`, { error: err.message, stack: err.stack }, err);
+    logStep(`[${requestId}] EXECUTION FAILED`, { 
+      error: err.message, 
+      stack: err.stack 
+    }, err);
     
     // Attempt to close connection
     if (client) {
@@ -168,8 +159,26 @@ export async function POST(req) {
       }
     }
 
+    // User-friendly error messages
+    let userMessage = err.message;
+    
+    if (err.message.includes("ECONNREFUSED")) {
+      userMessage = `Cannot connect to database. Please check your connection string.`;
+    } else if (err.message.includes("authentication") || err.message.includes("Authentication")) {
+      userMessage = `Authentication failed. Please check your database credentials.`;
+    } else if (err.message.includes("not found") || err.message.includes("does not exist")) {
+      userMessage = `Database, table, or collection not found. Please check the name.`;
+    } else if (err.message.includes("timeout")) {
+      userMessage = `Database connection timeout. Please check network or database status.`;
+    }
+
     return new Response(
-      JSON.stringify({ ok: false, error: err.message || "Execution failed", requestId }),
+      JSON.stringify({ 
+        ok: false, 
+        error: userMessage,
+        details: err.message,
+        requestId 
+      }),
       { status: 500 }
     );
   }

@@ -1,22 +1,91 @@
-// app/chat/page.js
+// ============================================================================
+// app/chat/page.js - Enhanced with Smart Table Discovery
+// ============================================================================
+
 "use client";
 import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
+
+// Database type detector
+function detectDatabaseType(uri) {
+  if (!uri) return null;
+  
+  const lower = uri.toLowerCase();
+  
+  if (lower.includes('mongodb://') || lower.includes('mongodb+srv://')) {
+    return { type: 'mongodb', name: 'MongoDB', icon: '🍃', color: 'green' };
+  }
+  if (lower.includes('postgresql://') || lower.includes('postgres://') || lower.includes('supabase.co')) {
+    const isSupabase = lower.includes('supabase.co');
+    return { 
+      type: isSupabase ? 'supabase' : 'postgresql', 
+      name: isSupabase ? 'Supabase' : 'PostgreSQL', 
+      icon: isSupabase ? '⚡' : '🐘', 
+      color: 'blue' 
+    };
+  }
+  if (lower.includes('mysql://')) {
+    return { type: 'mysql', name: 'MySQL', icon: '🐬', color: 'orange' };
+  }
+  if (lower.includes('redis://') || lower.includes('rediss://')) {
+    return { type: 'redis', name: 'Redis', icon: '🔴', color: 'red' };
+  }
+  
+  return null;
+}
+
+// ============================================================================
+// 🆕 SMART QUERY DETECTOR - Detects if user wants to see tables
+// ============================================================================
+function detectIntrospectionIntent(userText) {
+  const lower = userText.toLowerCase();
+  
+  const introspectionKeywords = [
+    // English
+    'show tables', 'list tables', 'what tables', 'available tables', 'show collections',
+    'list collections', 'what collections', 'show all tables', 'show database',
+    'what do you have', 'what data', 'show schema', 'database structure',
+    
+    // Hindi
+    'सभी tables दिखाओ', 'tables बताओ', 'कौन से tables', 'tables list',
+    'collections दिखाओ', 'database में क्या है',
+    
+    // Marathi
+    'सर्व tables दाखव', 'tables सांग', 'कोणते tables', 'database मध्ये काय आहे'
+  ];
+  
+  return introspectionKeywords.some(keyword => lower.includes(keyword));
+}
 
 export default function ChatPage() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [uri, setUri] = useState(null);
+  const [dbInfo, setDbInfo] = useState(null);
   const [executing, setExecuting] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [showDbDetails, setShowDbDetails] = useState(false);
   const messagesEndRef = useRef(null);
   const router = useRouter();
 
   useEffect(() => {
     setMounted(true);
     const stored = localStorage.getItem("dbURI") || "";
+    const storedType = localStorage.getItem("dbType") || "";
+    
     setUri(stored);
+    
+    if (stored) {
+      const detected = detectDatabaseType(stored);
+      setDbInfo({
+        ...detected,
+        dbType: storedType || detected?.type,
+        uri: stored,
+        truncatedUri: stored.substring(0, 60) + (stored.length > 60 ? '...' : '')
+      });
+    }
+    
     if (!stored) setTimeout(() => router.push("/connect"), 1500);
   }, [router]);
 
@@ -26,11 +95,115 @@ export default function ChatPage() {
 
   if (!mounted || !uri) return null;
 
+  // ============================================================================
+  // 🆕 SCAN DATABASE FUNCTION
+  // ============================================================================
+  async function scanDatabase() {
+    setMessages((m) => [...m, { 
+      role: "system", 
+      text: "🔍 Checking database schema..." 
+    }]);
+    setLoading(true);
+
+    try {
+      const res = await fetch("/api/db/introspect", {
+        method: "POST",
+        body: JSON.stringify({ uri }),
+        headers: { "Content-Type": "application/json" }
+      });
+      
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || `HTTP ${res.status}: ${res.statusText}`);
+      }
+      
+      const data = await res.json();
+      
+      if (!data.ok) {
+        throw new Error(data.error || "Introspection failed");
+      }
+      
+      // Validate response structure
+      if (!data.summary || !data.summary.tables) {
+        throw new Error("Invalid response structure from introspection API");
+      }
+      
+      const tables = data.summary.tables || [];
+      
+      if (tables.length === 0) {
+        setMessages((m) => [...m, {
+          role: "success",
+          text: `⚠️ No tables/collections found in ${data.summary.dbType?.toUpperCase() || 'database'}.\n\nThe database appears to be empty or you may not have permission to view tables.`
+        }]);
+        return;
+      }
+      
+      const tablesList = tables.map(t => `  • ${t}`).join('\n');
+      
+      const collectionWord = dbInfo?.dbType === 'mongodb' ? 'Collections' : 'Tables';
+      const recordWord = dbInfo?.dbType === 'mongodb' ? 'Documents' : 'Records';
+      
+      let detailsText = '';
+      if (data.collections && data.collections.length > 0) {
+        detailsText = '\n\n📊 Details:\n';
+        data.collections.forEach(col => {
+          const fields = col.fields || [];
+          const recordCount = col.recordCount || 0;
+          detailsText += `\n${col.name}:\n`;
+          detailsText += `  - Fields: ${fields.slice(0, 5).join(', ')}${fields.length > 5 ? '...' : ''}\n`;
+          detailsText += `  - ${recordWord}: ${recordCount.toLocaleString()}\n`;
+        });
+      }
+      
+      const totalRecords = data.summary.totalRecords || 0;
+      const dbType = data.summary.dbType?.toUpperCase() || 'DATABASE';
+      
+      const message = `✅ Found ${tables.length} ${collectionWord.toLowerCase()} in ${dbType}:\n\n${tablesList}\n\n📈 Total ${recordWord}: ${totalRecords.toLocaleString()}${detailsText}\n\n💡 Now you can ask: "show all ${tables[0]}"${tables[1] ? ` or "find data in ${tables[1]}"` : ''}`;
+      
+      setMessages((m) => [...m, {
+        role: "success",
+        text: message
+      }]);
+    } catch (err) {
+      console.error('Scan error:', err);
+      
+      let errorMessage = `❌ Scan failed: ${err.message}`;
+      
+      // Add helpful context based on error type
+      if (err.message.includes('fetch') || err.message.includes('NetworkError')) {
+        errorMessage += '\n\n💡 Check that your dev server is running and the introspection endpoint exists at /api/db/introspect';
+      } else if (err.message.includes('authentication') || err.message.includes('Authentication')) {
+        errorMessage += '\n\n💡 Check your database credentials in the connection string';
+      } else if (err.message.includes('ECONNREFUSED')) {
+        errorMessage += '\n\n💡 Check that your database server is running';
+      } else if (err.message.includes('404')) {
+        errorMessage += '\n\n💡 The introspection endpoint (/api/db/introspect) does not exist. Create it first.';
+      }
+      
+      setMessages((m) => [...m, {
+        role: "error",
+        text: errorMessage
+      }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ============================================================================
+  // 🆕 SMART SEND FUNCTION - Detects introspection intent
+  // ============================================================================
   async function send() {
     if (!input.trim()) return;
     const userText = input.trim();
     setMessages((m) => [...m, { role: "user", text: userText }]);
     setInput("");
+
+    // 🆕 Check if user is asking for tables/collections
+    if (detectIntrospectionIntent(userText)) {
+      await scanDatabase();
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -38,11 +211,11 @@ export default function ChatPage() {
       const res = await fetch("/api/ai/run-query", {
         method: "POST",
         body: JSON.stringify({ 
-          dbType: "mongodb", 
+          dbType: dbInfo?.dbType || "mongodb", 
           userText, 
-          collections: [], // Auto-detect collections
+          collections: [],
           previewLimit: 50,
-          uri: uri // Send URI for schema detection
+          uri: uri
         }),
         headers: { "Content-Type": "application/json" },
       });
@@ -50,25 +223,29 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
+        // 🆕 Smart error handling - suggest introspection on "does not exist" errors
+        if (data.error.includes('does not exist') || data.error.includes('not found')) {
+          throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
+        }
         throw new Error(data.error || "Failed to parse query");
       }
       
-      // Show generated query with metadata
       const metadataInfo = data.metadata?.schemaUsed 
         ? `\n📊 Schema-aware query` 
         : ``;
+      
+      const targetName = data.action.collection || data.action.table || data.action.key || "unknown";
       
       setMessages((m) => [
         ...m,
         { 
           role: "ai", 
-          text: `✅ Generated ${data.action.action} query on "${data.action.collection}"${metadataInfo}`, 
+          text: `✅ Generated ${data.action.action} query on "${targetName}"${metadataInfo}`, 
           action: data.action,
           metadata: data.metadata
         },
       ]);
     } catch (err) {
-      // Show helpful error messages
       const errorMsg = err.message.includes("Ollama") 
         ? `🔴 ${err.message}\n\nMake sure:\n1. Ollama is installed\n2. Run: ollama serve\n3. Pull model: ollama pull qwen2.5-coder:7b`
         : err.message;
@@ -80,8 +257,11 @@ export default function ChatPage() {
   }
 
   async function previewAction(action) {
-    if (action.action !== "find") {
-      alert("Preview only available for find queries");
+    const isFind = action.action === "find";
+    const dbType = dbInfo?.dbType || "mongodb";
+    
+    if (!isFind) {
+      alert("Preview only available for find/select queries");
       return;
     }
     
@@ -89,25 +269,30 @@ export default function ChatPage() {
     setExecuting(true);
 
     try {
-      // Execute with limit 5 for preview
+      const previewAction = { ...action };
+      
+      if (dbType === 'mongodb') {
+        previewAction.options = { 
+          ...action.options, 
+          limit: 5 
+        };
+      } else {
+        previewAction.limit = 5;
+      }
+      
       const res = await fetch("/api/ai/execute", {
         method: "POST",
-        body: JSON.stringify({ 
-          uri, 
-          action: { 
-            ...action, 
-            options: { 
-              ...action.options, 
-              limit: 5 
-            } 
-          } 
-        }),
+        body: JSON.stringify({ uri, action: previewAction }),
         headers: { "Content-Type": "application/json" },
       });
       
       const data = await res.json();
       
       if (!data.ok) {
+        // 🆕 Suggest introspection on table not found errors
+        if (data.error.includes('does not exist') || data.error.includes('not found')) {
+          throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
+        }
         throw new Error(data.error || "Preview failed");
       }
       
@@ -116,7 +301,6 @@ export default function ChatPage() {
         ? JSON.stringify(data.result, null, 2)
         : "No results found";
       
-      // Show projection info if available
       let projectionInfo = "";
       if (data.metadata?.projectionUsed && data.metadata?.fieldsReturned) {
         projectionInfo = `📋 Showing fields: ${data.metadata.fieldsReturned.join(', ')}\n\n`;
@@ -124,7 +308,7 @@ export default function ChatPage() {
       
       setMessages((m) => [...m, {
         role: "preview",
-        text: `🔍 Preview (showing ${resultCount} of total results):\n\n${projectionInfo}${resultText}`,
+        text: `🔍 Preview (showing ${resultCount} results):\n\n${projectionInfo}${resultText}`,
       }]);
     } catch (err) {
       setMessages((m) => [...m, { 
@@ -150,7 +334,6 @@ export default function ChatPage() {
     }]);
 
     try {
-      // Execute the query
       const res = await fetch("/api/ai/execute", {
         method: "POST",
         body: JSON.stringify({ uri, action }),
@@ -160,42 +343,14 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
+        // 🆕 Suggest introspection on errors
+        if (data.error.includes('does not exist') || data.error.includes('not found')) {
+          throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
+        }
         throw new Error(data.error || "Execution failed");
       }
       
-      // Format result based on action type
-      let resultText = "";
-      
-      if (Array.isArray(data.result)) {
-        // Find/Aggregate results
-        resultText = data.result.length > 0
-          ? JSON.stringify(data.result, null, 2)
-          : "No results found";
-        
-        // Show projection info if available
-        if (data.metadata?.projectionUsed) {
-          resultText = `📋 Showing fields: ${data.metadata.fieldsReturned.join(', ')}\n\n${resultText}`;
-        }
-        
-        resultText = `✅ Found ${data.result.length} document(s)\n\n${resultText}`;
-      } else {
-        // Insert/Update/Delete results
-        if (data.result.insertedCount !== undefined) {
-          resultText = `✅ Inserted ${data.result.insertedCount} document(s)`;
-          if (data.result.insertedId) {
-            resultText += `\nID: ${data.result.insertedId}`;
-          }
-        } else if (data.result.modifiedCount !== undefined) {
-          resultText = `✅ Modified ${data.result.modifiedCount} document(s)\n📊 Matched ${data.result.matchedCount} document(s)`;
-        } else if (data.result.deletedCount !== undefined) {
-          resultText = `✅ Deleted ${data.result.deletedCount} document(s)`;
-        } else if (data.result.total !== undefined) {
-          // Count result
-          resultText = `📊 Total count: ${data.result.total}`;
-        } else {
-          resultText = JSON.stringify(data.result, null, 2);
-        }
-      }
+      let resultText = formatExecutionResult(data.result, data.metadata);
       
       setMessages((m) => [...m, { 
         role: "success", 
@@ -211,26 +366,136 @@ export default function ChatPage() {
     }
   }
 
+  function formatExecutionResult(result, metadata) {
+    const dbType = metadata?.dbType || dbInfo?.dbType;
+    
+    if (Array.isArray(result)) {
+      let text = result.length > 0
+        ? JSON.stringify(result, null, 2)
+        : "No results found";
+      
+      if (metadata?.projectionUsed) {
+        text = `📋 Showing fields: ${metadata.fieldsReturned.join(', ')}\n\n${text}`;
+      }
+      
+      return `✅ Found ${result.length} ${dbType === 'mongodb' ? 'document(s)' : 'record(s)'}\n\n${text}`;
+    }
+    
+    if (result.insertedCount !== undefined) {
+      let text = `✅ Inserted ${result.insertedCount} ${dbType === 'mongodb' ? 'document(s)' : 'record(s)'}`;
+      if (result.insertedId) text += `\nID: ${result.insertedId}`;
+      if (result.insertedIds && Object.keys(result.insertedIds).length > 0) {
+        text += `\nIDs: ${JSON.stringify(result.insertedIds)}`;
+      }
+      return text;
+    }
+    
+    if (result.modifiedCount !== undefined) {
+      return `✅ Modified ${result.modifiedCount} ${dbType === 'mongodb' ? 'document(s)' : 'record(s)'}\n📊 Matched ${result.matchedCount || 0} ${dbType === 'mongodb' ? 'document(s)' : 'record(s)'}`;
+    }
+    
+    if (result.deletedCount !== undefined) {
+      return `✅ Deleted ${result.deletedCount} ${dbType === 'mongodb' ? 'document(s)' : 'record(s)'}`;
+    }
+    
+    if (result.total !== undefined) {
+      return `📊 Total count: ${result.total}`;
+    }
+    
+    if (dbType === 'redis' && result.key) {
+      return `✅ Redis operation complete\n\n${JSON.stringify(result, null, 2)}`;
+    }
+    
+    return JSON.stringify(result, null, 2);
+  }
+
   return (
     <div className="fixed inset-0 flex items-center justify-center p-4 sm:p-6 pointer-events-none">
-      {/* Centered Chat Container */}
       <div className="w-full max-w-5xl h-[calc(100vh-3rem)] flex flex-col bg-black/20 backdrop-blur-md border border-neutral-800/50 rounded-2xl shadow-2xl overflow-hidden pointer-events-auto">
         
-        {/* Header */}
+        {/* Enhanced Header with Database Info */}
         <div className="border-b border-neutral-800/50 bg-black/10">
-          <div className="px-6 py-4 flex items-center justify-between">
-            <div>
-              <h1 className="text-xl font-bold text-white">🤖 DB Agent</h1>
-              <p className="text-xs text-gray-400">
-                Connected • Powered by Ollama (qwen2.5-coder:7b)
-              </p>
+          <div className="px-6 py-4">
+            {/* Top Row */}
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-3">
+                <h1 className="text-xl font-bold text-white">🤖 DB Agent</h1>
+                {dbInfo && (
+                  <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-black/30 border border-neutral-700/30">
+                    <span className="text-lg">{dbInfo.icon}</span>
+                    <span className="text-sm font-semibold text-white">{dbInfo.name}</span>
+                    <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {/* 🆕 Scan Database Button */}
+                <button
+                  onClick={scanDatabase}
+                  disabled={loading || executing}
+                  className="text-sm text-gray-400 hover:text-white transition px-3 py-1 rounded-lg hover:bg-black/30 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Scan database to see available tables/collections"
+                >
+                  🔍 <span>Scan Database</span>
+                </button>
+                <button
+                  onClick={() => { 
+                    localStorage.removeItem("dbURI"); 
+                    localStorage.removeItem("dbType");
+                    router.push("/connect"); 
+                  }}
+                  className="text-sm text-gray-400 hover:text-white transition px-3 py-1 rounded-lg hover:bg-black/30"
+                >
+                  Change Database
+                </button>
+              </div>
             </div>
-            <button
-              onClick={() => { localStorage.removeItem("dbURI"); router.push("/connect"); }}
-              className="text-sm text-gray-400 hover:text-white transition"
-            >
-              Disconnect
-            </button>
+            
+            {/* Bottom Row - Connection Details */}
+            <div className="flex items-center justify-between text-xs">
+              <div className="flex items-center gap-4 text-gray-400">
+                <span>Powered by Ollama (qwen2.5-coder:7b)</span>
+                <span className="text-gray-600">•</span>
+                <button
+                  onClick={() => setShowDbDetails(!showDbDetails)}
+                  className="hover:text-white transition flex items-center gap-1"
+                >
+                  <span>Connection Details</span>
+                  <span className="text-xs">{showDbDetails ? '▲' : '▼'}</span>
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-gray-500">Database Type:</span>
+                <span className="font-mono font-semibold text-gray-300">{dbInfo?.dbType || 'mongodb'}</span>
+              </div>
+            </div>
+
+            {/* Expandable Connection Details */}
+            {showDbDetails && dbInfo && (
+              <div className="mt-3 p-3 rounded-lg bg-black/30 border border-neutral-700/30 animate-in slide-in-from-top duration-200">
+                <div className="grid grid-cols-1 gap-2 text-xs">
+                  <div className="flex items-start gap-2">
+                    <span className="text-gray-500 min-w-20">Database:</span>
+                    <span className="text-gray-300 font-semibold">{dbInfo.name}</span>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <span className="text-gray-500 min-w-20">Type:</span>
+                    <span className="text-gray-300 font-mono">{dbInfo.dbType}</span>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <span className="text-gray-500 min-w-20">URI:</span>
+                    <span className="text-gray-300 font-mono break-all">{dbInfo.truncatedUri}</span>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <span className="text-gray-500 min-w-20">Status:</span>
+                    <span className="text-green-400 flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></span>
+                      Connected
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -242,7 +507,10 @@ export default function ChatPage() {
               {messages.length === 0 ? (
                 // Empty State
                 <div className="flex flex-col items-center justify-center h-full w-full px-4 py-8">
-                  <h2 className="text-4xl font-bold text-white mb-3">Ask Your Database</h2>
+                  <div className="text-6xl mb-4">{dbInfo?.icon || '🤖'}</div>
+                  <h2 className="text-4xl font-bold text-white mb-3">
+                    Ask Your {dbInfo?.name || 'Database'}
+                  </h2>
                   <p className="text-gray-400 mb-2 max-w-md text-center text-base">
                     Type queries in <span className="text-white font-semibold">English</span>, 
                     <span className="text-white font-semibold"> Hindi (हिंदी)</span>, or 
@@ -253,18 +521,23 @@ export default function ChatPage() {
                   </p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl">
                     {[
-                      { en: "Find all users", hi: "सभी users दिखाओ" },
-                      { en: "Show Ram's email", hi: "Ram का email बताओ" },
-                      { en: "Count all users", hi: "सभी users गिनो" },
-                      { en: "List all emails", hi: "सर्व emails दाखव" }
+                      { en: "Show tables", hi: "Tables दिखाओ", icon: "🔍" },
+                      { en: "Show Ram's email", hi: "Ram का email बताओ", icon: "📧" },
+                      { en: "Count all users", hi: "सभी users गिनो", icon: "🔢" },
+                      { en: "List all emails", hi: "सर्व emails दाखव", icon: "📋" }
                     ].map((q, i) => (
                       <button
                         key={i}
                         onClick={() => setInput(q.en)}
                         className="px-4 py-3 rounded-lg bg-black/20 backdrop-blur-md hover:bg-black/30 border border-neutral-700/30 text-gray-300 hover:text-white transition text-sm font-medium text-left"
                       >
-                        <div className="font-semibold">{q.en}</div>
-                        <div className="text-xs text-gray-500 mt-1">{q.hi}</div>
+                        <div className="flex items-center gap-2">
+                          <span>{q.icon}</span>
+                          <div className="flex-1">
+                            <div className="font-semibold">{q.en}</div>
+                            <div className="text-xs text-gray-500 mt-1">{q.hi}</div>
+                          </div>
+                        </div>
                       </button>
                     ))}
                   </div>
@@ -331,7 +604,7 @@ export default function ChatPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyPress={(e) => e.key === "Enter" && !loading && !executing && send()}
-                  placeholder="Ask in English, Hindi (हिंदी), or Marathi (मराठी)..."
+                  placeholder={`Ask ${dbInfo?.name || 'your database'} in English, Hindi (हिंदी), or Marathi (मराठी)...`}
                   className="flex-1 px-4 py-3 rounded-lg bg-black/20 backdrop-blur-md border border-neutral-700/30 hover:border-neutral-600/30 text-white placeholder-gray-500 focus:outline-none focus:border-white/50 focus:ring-1 focus:ring-white/20 transition text-sm disabled:opacity-50"
                   disabled={loading || executing}
                 />
@@ -344,7 +617,7 @@ export default function ChatPage() {
                 </button>
               </div>
               <p className="text-xs text-gray-500 mt-2">
-                💡 Press Enter to send • Try: "Ram का email बताओ" • Powered by local Ollama
+                💡 Press Enter to send • Try "show tables" to see available data • Connected to {dbInfo?.name || 'Database'}
               </p>
             </div>
           </div>
