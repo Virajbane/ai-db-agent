@@ -1,0 +1,47 @@
+# ============================================================================
+# requirements.txt - Python Dependencies for IndicTrans2 Service (Windows Compatible)
+# ============================================================================
+
+# FastAPI and web server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# IndicTrans2 dependencies (Updated for Windows)
+transformers==4.35.2
+torch>=2.2.0  # Use latest available version
+sentencepiece==0.1.99
+sacremoses==0.1.1
+
+# Utilities
+python-multipart==0.0.6
+httpx==0.25.1
+
+# ============================================================================
+# Installation Instructions:
+# ============================================================================
+#
+# 1. Create virtual environment:
+#    python -m venv venv
+#    venv\Scripts\activate  # On Windows
+#
+# 2. Install dependencies:
+#    pip install -r requirements.txt
+#
+# 3. Run the service:
+#    python indictrans2_service.py
+#
+# ============================================================================
+# Note: For GPU support (optional, faster), install PyTorch with CUDA:
+# ============================================================================
+#
+# Uninstall CPU version first:
+#    pip uninstall torch
+#
+# Install GPU version (requires NVIDIA GPU):
+#    pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Check CUDA availability:
+#    python -c "import torch; print(torch.cuda.is_available())"
+#
+# ============================================================================

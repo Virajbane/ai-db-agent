@@ -1,5 +1,5 @@
 // ============================================================================
-// app/chat/page.js - Enhanced with Smart Table Discovery
+// app/chat/page.js - Enhanced with Smart Table Discovery & Confirmation Dialog
 // ============================================================================
 
 "use client";
@@ -35,7 +35,7 @@ function detectDatabaseType(uri) {
 }
 
 // ============================================================================
-// 🆕 SMART QUERY DETECTOR - Detects if user wants to see tables
+// SMART QUERY DETECTOR - Detects if user wants to see tables
 // ============================================================================
 function detectIntrospectionIntent(userText) {
   const lower = userText.toLowerCase();
@@ -66,6 +66,11 @@ export default function ChatPage() {
   const [executing, setExecuting] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [showDbDetails, setShowDbDetails] = useState(false);
+  
+  // 🆕 Confirmation dialog state
+  const [confirmationDialog, setConfirmationDialog] = useState(null);
+  const [pendingAction, setPendingAction] = useState(null);
+  
   const messagesEndRef = useRef(null);
   const router = useRouter();
 
@@ -96,7 +101,7 @@ export default function ChatPage() {
   if (!mounted || !uri) return null;
 
   // ============================================================================
-  // 🆕 SCAN DATABASE FUNCTION
+  // SCAN DATABASE FUNCTION
   // ============================================================================
   async function scanDatabase() {
     setMessages((m) => [...m, { 
@@ -123,7 +128,6 @@ export default function ChatPage() {
         throw new Error(data.error || "Introspection failed");
       }
       
-      // Validate response structure
       if (!data.summary || !data.summary.tables) {
         throw new Error("Invalid response structure from introspection API");
       }
@@ -169,7 +173,6 @@ export default function ChatPage() {
       
       let errorMessage = `❌ Scan failed: ${err.message}`;
       
-      // Add helpful context based on error type
       if (err.message.includes('fetch') || err.message.includes('NetworkError')) {
         errorMessage += '\n\n💡 Check that your dev server is running and the introspection endpoint exists at /api/db/introspect';
       } else if (err.message.includes('authentication') || err.message.includes('Authentication')) {
@@ -190,7 +193,7 @@ export default function ChatPage() {
   }
 
   // ============================================================================
-  // 🆕 SMART SEND FUNCTION - Detects introspection intent
+  // 🆕 SMART SEND FUNCTION - With Pipeline & Confirmation
   // ============================================================================
   async function send() {
     if (!input.trim()) return;
@@ -198,7 +201,6 @@ export default function ChatPage() {
     setMessages((m) => [...m, { role: "user", text: userText }]);
     setInput("");
 
-    // 🆕 Check if user is asking for tables/collections
     if (detectIntrospectionIntent(userText)) {
       await scanDatabase();
       return;
@@ -207,7 +209,6 @@ export default function ChatPage() {
     setLoading(true);
 
     try {
-      // Call Ollama AI to parse query
       const res = await fetch("/api/ai/run-query", {
         method: "POST",
         body: JSON.stringify({ 
@@ -223,28 +224,32 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
-        // 🆕 Smart error handling - suggest introspection on "does not exist" errors
         if (data.error.includes('does not exist') || data.error.includes('not found')) {
           throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
         }
         throw new Error(data.error || "Failed to parse query");
       }
       
-      const metadataInfo = data.metadata?.schemaUsed 
-        ? `\n📊 Schema-aware query` 
-        : ``;
+      // 🆕 SMART CONFIRMATION LOGIC
+      // Only show confirmation if:
+      // 1. Low confidence (< 0.8) - user might have meant something else
+      // 2. Destructive action (UPDATE/DELETE) - always confirm before modifying data
+      // 3. Unknown intent - we're not sure what user wants
       
-      const targetName = data.action.collection || data.action.table || data.action.key || "unknown";
+      const needsConfirmation = 
+        (data.pipeline?.confidence < 0.8) ||  // Low confidence
+        (data.pipeline?.isDestructive) ||     // Destructive (UPDATE/DELETE)
+        (data.pipeline?.intent === 'UNKNOWN'); // Unclear intent
       
-      setMessages((m) => [
-        ...m,
-        { 
-          role: "ai", 
-          text: `✅ Generated ${data.action.action} query on "${targetName}"${metadataInfo}`, 
-          action: data.action,
-          metadata: data.metadata
-        },
-      ]);
+      if (needsConfirmation) {
+        showConfirmationDialog(data);
+        setLoading(false);
+        return;
+      }
+      
+      // High confidence + safe action (READ) - proceed directly
+      displayQueryResult(data);
+      
     } catch (err) {
       const errorMsg = err.message.includes("Ollama") 
         ? `🔴 ${err.message}\n\nMake sure:\n1. Ollama is installed\n2. Run: ollama serve\n3. Pull model: ollama pull qwen2.5-coder:7b`
@@ -256,6 +261,109 @@ export default function ChatPage() {
     }
   }
 
+  // ============================================================================
+  // 🆕 CONFIRMATION DIALOG FUNCTIONS
+  // ============================================================================
+  function showConfirmationDialog(data) {
+    const { pipeline, action } = data;
+    
+    // Create user-friendly message based on action
+    let userFriendlyMessage = "";
+    const targetName = action.collection || action.table || "data";
+    
+    if (action.action === "find") {
+      userFriendlyMessage = `Do you want to see all records from "${targetName}"?`;
+    } else if (action.action === "updateOne" || action.action === "update") {
+      userFriendlyMessage = `Do you want to update data in "${targetName}"?`;
+    } else if (action.action === "deleteOne" || action.action === "delete") {
+      userFriendlyMessage = `Do you want to delete data from "${targetName}"?`;
+    } else if (action.action === "insertOne" || action.action === "insert") {
+      userFriendlyMessage = `Do you want to add new data to "${targetName}"?`;
+    } else {
+      userFriendlyMessage = `Do you want to ${action.action} on "${targetName}"?`;
+    }
+    
+    let dialogContent = {
+      title: "",
+      message: "",
+      userFriendlyMessage: userFriendlyMessage,
+      isDestructive: pipeline.isDestructive,
+      action: action,
+      pipeline: pipeline,
+      showQuery: false // 🆕 Don't show technical query by default
+    };
+    
+    if (pipeline.confidence < 0.8) {
+      dialogContent.title = "🤔 Please Confirm";
+      dialogContent.message = `I understood: "${pipeline.normalized}"`;
+      dialogContent.type = "clarification";
+    } else if (pipeline.isDestructive) {
+      dialogContent.title = "⚠️ Warning";
+      dialogContent.message = "This will modify your database data.";
+      dialogContent.type = "destructive";
+    }
+    
+    setConfirmationDialog(dialogContent);
+    setPendingAction(data);
+  }
+
+  function confirmAction() {
+    if (pendingAction) {
+      // Close dialog first
+      setConfirmationDialog(null);
+      
+      // Display result in chat
+      displayQueryResult(pendingAction);
+      
+      // Clear pending
+      setPendingAction(null);
+    }
+  }
+
+  function cancelAction() {
+    setMessages((m) => [...m, { 
+      role: "system", 
+      text: "❌ Action cancelled by user" 
+    }]);
+    setConfirmationDialog(null);
+    setPendingAction(null);
+  }
+
+  function displayQueryResult(data) {
+    const targetName = data.action.collection || data.action.table || data.action.key || "unknown";
+    
+    // Create user-friendly message based on action
+    let userMessage = "";
+    
+    if (data.action.action === "find") {
+      userMessage = `✅ Okay! I'll show you data from "${targetName}"`;
+    } else if (data.action.action === "updateOne" || data.action.action === "update") {
+      userMessage = `✅ I'll update the data in "${targetName}"`;
+    } else if (data.action.action === "deleteOne" || data.action.action === "delete") {
+      userMessage = `✅ I'll delete the data from "${targetName}"`;
+    } else if (data.action.action === "insertOne" || data.action.action === "insert") {
+      userMessage = `✅ I'll add new data to "${targetName}"`;
+    } else if (data.action.action === "count") {
+      userMessage = `✅ I'll count records in "${targetName}"`;
+    } else {
+      userMessage = `✅ Ready to ${data.action.action} on "${targetName}"`;
+    }
+    
+    setMessages((m) => [
+      ...m,
+      { 
+        role: "ai", 
+        text: userMessage, 
+        action: data.action,
+        metadata: data.metadata,
+        pipeline: data.pipeline
+      },
+    ]);
+  }
+
+  // ============================================================================
+  // PREVIEW & EXECUTE FUNCTIONS
+  // ============================================================================
   async function previewAction(action) {
     const isFind = action.action === "find";
     const dbType = dbInfo?.dbType || "mongodb";
@@ -289,7 +397,6 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
-        // 🆕 Suggest introspection on table not found errors
         if (data.error.includes('does not exist') || data.error.includes('not found')) {
           throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
         }
@@ -343,7 +450,6 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
-        // 🆕 Suggest introspection on errors
         if (data.error.includes('does not exist') || data.error.includes('not found')) {
           throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
         }
@@ -409,6 +515,9 @@ export default function ChatPage() {
     return JSON.stringify(result, null, 2);
   }
 
+  // ============================================================================
+  // RENDER
+  // ============================================================================
   return (
     <div className="fixed inset-0 flex items-center justify-center p-4 sm:p-6 pointer-events-none">
       <div className="w-full max-w-5xl h-[calc(100vh-3rem)] flex flex-col bg-black/20 backdrop-blur-md border border-neutral-800/50 rounded-2xl shadow-2xl overflow-hidden pointer-events-auto">
@@ -429,7 +538,6 @@ export default function ChatPage() {
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {/* 🆕 Scan Database Button */}
                 <button
                   onClick={scanDatabase}
                   disabled={loading || executing}
@@ -623,6 +731,80 @@ export default function ChatPage() {
           </div>
         </div>
       </div>
+
+      {/* 🆕 CONFIRMATION DIALOG UI */}
+      {confirmationDialog && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-black/90 backdrop-blur-md border-2 border-neutral-700 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+            
+            {/* Title */}
+            <div className="flex items-center gap-3 mb-4">
+              <span className="text-3xl">
+                {confirmationDialog.type === 'destructive' ? '⚠️' : '🤔'}
+              </span>
+              <h3 className="text-xl font-bold text-white">
+                {confirmationDialog.title}
+              </h3>
+            </div>
+
+            {/* User-Friendly Message */}
+            <p className="text-gray-300 mb-3 text-base">
+              {confirmationDialog.message}
+            </p>
+            
+            <p className="text-white mb-4 text-lg font-medium">
+              {confirmationDialog.userFriendlyMessage}
+            </p>
+
+            {/* Optional: Show what was understood (for low confidence) */}
+            {confirmationDialog.type === 'clarification' && (
+              <div className="mb-4 p-3 rounded-lg bg-blue-500/10 border border-blue-500/30">
+                <p className="text-sm text-blue-300">
+                  💭 You said: "{confirmationDialog.pipeline.original}"
+                </p>
+              </div>
+            )}
+
+            {/* Buttons */}
+            <div className="flex gap-3">
+              {confirmationDialog.type === 'destructive' ? (
+                <>
+                  <button
+                    onClick={cancelAction}
+                    className="flex-1 px-4 py-2.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-white font-medium transition"
+                  >
+                    ❌ No, Cancel
+                  </button>
+                  <button
+                    onClick={confirmAction}
+                    className="flex-1 px-4 py-2.5 rounded-lg bg-red-600 hover:bg-red-700 text-white font-bold transition"
+                  >
+                    ✅ Yes, Do It
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => {
+                      cancelAction();
+                      setInput(confirmationDialog.pipeline.original);
+                    }}
+                    className="flex-1 px-4 py-2.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-white font-medium transition"
+                  >
+                    ✏️ Let Me Retype
+                  </button>
+                  <button
+                    onClick={confirmAction}
+                    className="flex-1 px-4 py-2.5 rounded-lg bg-green-600 hover:bg-green-700 text-white font-bold transition"
+                  >
+                    ✅ Yes, Proceed
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

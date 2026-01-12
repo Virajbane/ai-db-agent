@@ -1,5 +1,5 @@
 // ============================================================================
-// app/api/ai/run-query/route.js - Universal Query Parser with Multi-DB Support
+// app/api/ai/run-query/route.js - Enhanced with Multi-Stage Pipeline
 // ============================================================================
 
 import { NextResponse } from "next/server";
@@ -40,32 +40,88 @@ export async function POST(req) {
     if (!dbType) {
       return NextResponse.json({ 
         ok: false, 
-        error: "Unsupported database type. Supported: MongoDB, PostgreSQL, MySQL, Redis, Supabase" 
+        error: "Unsupported database type" 
       }, { status: 400 });
     }
 
-    logStep(`[${requestId}] 📋 REQUEST DETAILS`, { 
+    logStep(`[${requestId}] 📋 ORIGINAL INPUT`, { 
       dbType,
-      userText, 
-      collectionsCount: collections.length, 
-      previewLimit
+      userText
     });
 
     // ========================================================================
-    // Fetch universal database metadata
+    // 🆕 STAGE 1: Language Normalization
+    // ========================================================================
+    logStep(`[${requestId}] 🌍 STAGE 1: Language Normalization`);
+    
+    const normResponse = await fetch("http://localhost:3000/api/ai/normalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userText })
+    });
+
+    if (!normResponse.ok) {
+      throw new Error("Language normalization failed");
+    }
+
+    const normData = await normResponse.json();
+    
+    if (!normData.ok) {
+      throw new Error(normData.error || "Normalization failed");
+    }
+
+    const normalizedText = normData.normalized;
+    const detectedLanguage = normData.detectedLanguage;
+
+    logStep(`[${requestId}] ✅ NORMALIZED`, {
+      original: userText,
+      normalized: normalizedText,
+      language: detectedLanguage
+    });
+
+    // ========================================================================
+    // 🆕 STAGE 2: Intent Classification
+    // ========================================================================
+    logStep(`[${requestId}] 🎯 STAGE 2: Intent Classification`);
+    
+    const intentResponse = await fetch("http://localhost:3000/api/ai/classify-intent", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ 
+    normalizedText, 
+    dbType,
+    langConfidence: normData.confidence // 🆕 Pass this through
+  })
+});
+
+    if (!intentResponse.ok) {
+      throw new Error("Intent classification failed");
+    }
+
+    const intentData = await intentResponse.json();
+    
+    if (!intentData.ok) {
+      throw new Error(intentData.error || "Intent classification failed");
+    }
+
+    logStep(`[${requestId}] ✅ INTENT CLASSIFIED`, {
+      intent: intentData.intent,
+      confidence: intentData.confidence,
+      isDestructive: intentData.isDestructive,
+      needsConfirmation: intentData.needsConfirmation
+    });
+
+    // ========================================================================
+    // Fetch database metadata
     // ========================================================================
     let collectionSchemas = {};
     let dbMetadata = null;
     
     try {
-      logStep(`[${requestId}] 🔍 FETCHING ${dbType.toUpperCase()} METADATA`, { 
-        collectionsProvided: collections.length,
-        cacheEnabled: true
-      });
+      logStep(`[${requestId}] 🔍 FETCHING ${dbType.toUpperCase()} METADATA`);
       
       dbMetadata = await getCachedUniversalMetadata(uri, false);
       
-      // Build collection schemas map
       dbMetadata.collections.forEach(col => {
         collectionSchemas[col.name] = {
           fields: col.fields,
@@ -76,57 +132,38 @@ export async function POST(req) {
         };
       });
       
-      const schemaDetails = Object.entries(collectionSchemas).map(([name, schema]) => ({
-        name,
-        fieldCount: schema.fields?.length || 0,
-        fields: schema.fields || [],
-        documentCount: schema.documentCount || 0
-      }));
-      
       logStep(`[${requestId}] ✅ METADATA LOADED`, { 
-        totalCollections: Object.keys(collectionSchemas).length,
-        totalDocuments: dbMetadata.totalDocuments,
-        scannedAt: dbMetadata.scannedAt,
-        fromCache: true,
-        details: schemaDetails
+        totalCollections: Object.keys(collectionSchemas).length
       });
     } catch (schemaError) {
       logStep(`[${requestId}] ⚠️ INTROSPECTION FAILED`, { 
-        error: schemaError.message,
-        note: "AI will work without schema context"
+        error: schemaError.message
       });
     }
 
-    // Prepare collections list
     const collectionsForAI = Object.keys(collectionSchemas).length > 0 
       ? Object.keys(collectionSchemas) 
       : collections;
 
-    logStep(`[${requestId}] 🤖 CALLING OLLAMA AI`, { 
-      userText, 
-      dbType,
-      hasSchemas: Object.keys(collectionSchemas).length > 0,
-      collections: collectionsForAI,
-      model: "qwen2.5-coder:7b"
-    });
+    // ========================================================================
+    // Generate Query (use normalized text)
+    // ========================================================================
+    logStep(`[${requestId}] 🤖 GENERATING QUERY`);
 
-    // Call Ollama AI with database-specific context
     const action = await parseUniversalInstruction({ 
       dbType,
-      userText, 
+      userText: normalizedText, // 🆕 Use normalized text
       collections: collectionsForAI, 
       previewLimit,
       collectionSchemas
     });
 
-    logStep(`[${requestId}] ✅ OLLAMA RESPONSE PARSED`, {
+    logStep(`[${requestId}] ✅ QUERY GENERATED`, {
       action: action.action,
-      target: action.collection || action.table,
-      hasQuery: !!(action.query || action.where),
-      dbType
+      target: action.collection || action.table
     });
 
-    // Validate parsed action
+    // Validate action
     const validation = validateAction(action);
     if (!validation.valid) {
       logStep(`[${requestId}] ❌ ACTION VALIDATION FAILED`, validation.errors);
@@ -141,46 +178,27 @@ export async function POST(req) {
     }
 
     // ========================================================================
-    // Validate fields against schema (if available)
+    // Build enriched response with pipeline metadata
     // ========================================================================
-    const targetName = action.collection || action.table;
-    if (collectionSchemas[targetName]) {
-      const availableFields = collectionSchemas[targetName].fields;
-      const queryFields = Object.keys(action.query || action.where || {});
-      
-      const invalidFields = queryFields.filter(field => {
-        if (field.startsWith('$')) return false; // MongoDB operators
-        return !availableFields.includes(field);
-      });
-      
-      if (invalidFields.length > 0) {
-        logStep(`[${requestId}] ⚠️ FIELD VALIDATION WARNING`, {
-          invalidFields,
-          availableFields,
-          note: "Query may fail or return unexpected results"
-        });
-      }
-    }
-
-    logStep(`[${requestId}] ✅ ACTION VALIDATED SUCCESSFULLY`, { 
-      action: action.action,
-      target: action.collection || action.table
-    });
-
-    // Success response
     return NextResponse.json({ 
       ok: true, 
       action, 
       requestId,
+      pipeline: {
+        original: userText,
+        normalized: normalizedText,
+        detectedLanguage,
+        intent: intentData.intent,
+        confidence: intentData.confidence,
+        isDestructive: intentData.isDestructive,
+        needsConfirmation: intentData.needsConfirmation
+      },
       metadata: {
         dbType,
         schemaUsed: Object.keys(collectionSchemas).length > 0,
         collectionsAvailable: collectionsForAI,
         totalDocuments: dbMetadata?.totalDocuments || 0,
-        scannedAt: dbMetadata?.scannedAt || null,
-        model: "qwen2.5-coder:7b",
-        provider: "Ollama (local)",
-        introspectionEngine: "universal-v1.0"
+        model: "qwen2.5-coder:7b"
       }
     });
     
@@ -190,21 +208,10 @@ export async function POST(req) {
       stack: error.stack 
     }, error);
     
-    let userMessage = error.message;
-    
-    if (error.message.includes("Ollama is not running")) {
-      userMessage = "🔴 Ollama is not running. Please start it with: ollama serve";
-    } else if (error.message.includes("Failed to parse")) {
-      userMessage = "🔴 AI response was invalid. Try rephrasing your query.";
-    } else if (error.message.includes("connect")) {
-      userMessage = "🔴 Cannot connect to database or Ollama. Check your connections.";
-    }
-    
     return NextResponse.json(
       { 
         ok: false, 
-        error: userMessage,
-        details: error.message,
+        error: error.message,
         requestId
       },
       { status: 500 }
