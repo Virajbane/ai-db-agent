@@ -580,7 +580,7 @@ For issues, questions, or suggestions:
 
 - 🐛 [GitHub Issues](https://github.com/yourusername/ai-db-agent/issues)
 - 💬 [Discussions](https://github.com/yourusername/ai-db-agent/discussions)
-- 📧 Email: your.email@example.com
+- 📧 Email: virajbane2004@gmail.com
 
 ---
 
