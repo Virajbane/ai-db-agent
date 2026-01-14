@@ -224,22 +224,29 @@ export default function ChatPage() {
       const data = await res.json();
       
       if (!data.ok) {
-        if (data.error.includes('does not exist') || data.error.includes('not found')) {
+        if (data.error && data.error.includes('does not exist')) {
           throw new Error(data.error + '\n\n💡 Tip: Type "show tables" to see available tables');
         }
         throw new Error(data.error || "Failed to parse query");
       }
       
+      // 🆕 Show translation in chat if non-English
+      if (data.pipeline?.detectedLanguage !== 'english' && 
+          data.pipeline?.normalized !== userText) {
+        setMessages((m) => [...m, {
+          role: "system",
+          text: `💬 I understood: "${data.pipeline.normalized}"`
+        }]);
+      }
+      
       // 🆕 SMART CONFIRMATION LOGIC
-      // Only show confirmation if:
-      // 1. Low confidence (< 0.8) - user might have meant something else
-      // 2. Destructive action (UPDATE/DELETE) - always confirm before modifying data
-      // 3. Unknown intent - we're not sure what user wants
+      // Only show confirmation for:
+      // 1. UPDATE/DELETE (destructive)
+      // 2. Low confidence (< 0.6) - very unsure
       
       const needsConfirmation = 
-        (data.pipeline?.confidence < 0.8) ||  // Low confidence
-        (data.pipeline?.isDestructive) ||     // Destructive (UPDATE/DELETE)
-        (data.pipeline?.intent === 'UNKNOWN'); // Unclear intent
+        (data.pipeline?.isDestructive) ||     // Always confirm destructive
+        (data.pipeline?.confidence < 0.6);     // Only if very low confidence
       
       if (needsConfirmation) {
         showConfirmationDialog(data);
@@ -247,7 +254,7 @@ export default function ChatPage() {
         return;
       }
       
-      // High confidence + safe action (READ) - proceed directly
+      // High confidence or READ - proceed directly
       displayQueryResult(data);
       
     } catch (err) {
@@ -295,7 +302,12 @@ export default function ChatPage() {
     
     if (pipeline.confidence < 0.8) {
       dialogContent.title = "🤔 Please Confirm";
-      dialogContent.message = `I understood: "${pipeline.normalized}"`;
+      // Show English translation instead of original text
+      if (pipeline.detectedLanguage !== 'english') {
+        dialogContent.message = `I translated your message to:\n"${pipeline.normalized}"`;
+      } else {
+        dialogContent.message = `I understood: "${pipeline.normalized}"`;
+      }
       dialogContent.type = "clarification";
     } else if (pipeline.isDestructive) {
       dialogContent.title = "⚠️ Warning";
@@ -308,14 +320,32 @@ export default function ChatPage() {
   }
 
   function confirmAction() {
-    if (pendingAction) {
+    console.log('🔘 Confirm button clicked');
+    console.log('📦 Pending action:', pendingAction);
+    
+    if (!pendingAction) {
+      console.error('❌ No pending action found!');
+      setConfirmationDialog(null);
+      return;
+    }
+    
+    try {
       // Close dialog first
       setConfirmationDialog(null);
       
       // Display result in chat
+      console.log('✅ Displaying query result');
       displayQueryResult(pendingAction);
       
       // Clear pending
+      setPendingAction(null);
+    } catch (error) {
+      console.error('❌ Error in confirmAction:', error);
+      setMessages((m) => [...m, { 
+        role: "error", 
+        text: `Error: ${error.message}` 
+      }]);
+      setConfirmationDialog(null);
       setPendingAction(null);
     }
   }
@@ -332,6 +362,9 @@ export default function ChatPage() {
   function displayQueryResult(data) {
     const targetName = data.action.collection || data.action.table || data.action.key || "unknown";
     
+    // 🐛 DEBUG: Log the actual query
+    console.log('📊 Generated Query:', JSON.stringify(data.action, null, 2));
+    
     // Create user-friendly message based on action
     let userMessage = "";
     
@@ -339,6 +372,14 @@ export default function ChatPage() {
       userMessage = `✅ Okay! I'll show you data from "${targetName}"`;
     } else if (data.action.action === "updateOne" || data.action.action === "update") {
       userMessage = `✅ I'll update the data in "${targetName}"`;
+      
+      // 🐛 Show what it's trying to update
+      if (data.action.filter) {
+        userMessage += `\n\n🔍 Looking for: ${JSON.stringify(data.action.filter)}`;
+      }
+      if (data.action.update) {
+        userMessage += `\n✏️ Changing to: ${JSON.stringify(data.action.update)}`;
+      }
     } else if (data.action.action === "deleteOne" || data.action.action === "delete") {
       userMessage = `✅ I'll delete the data from "${targetName}"`;
     } else if (data.action.action === "insertOne" || data.action.action === "insert") {
@@ -519,7 +560,8 @@ export default function ChatPage() {
   // RENDER
   // ============================================================================
   return (
-    <div className="fixed inset-0 flex items-center justify-center p-4 sm:p-6 pointer-events-none">
+    <>
+      <div className="fixed inset-0 flex items-center justify-center p-4 sm:p-6 pointer-events-none">
       <div className="w-full max-w-5xl h-[calc(100vh-3rem)] flex flex-col bg-black/20 backdrop-blur-md border border-neutral-800/50 rounded-2xl shadow-2xl overflow-hidden pointer-events-auto">
         
         {/* Enhanced Header with Database Info */}
@@ -731,11 +773,18 @@ export default function ChatPage() {
           </div>
         </div>
       </div>
+      </div>
 
-      {/* 🆕 CONFIRMATION DIALOG UI */}
+      {/* 🆕 CONFIRMATION DIALOG UI - OUTSIDE MAIN CONTAINER */}
       {confirmationDialog && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-black/90 backdrop-blur-md border-2 border-neutral-700 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+        <div 
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          style={{ zIndex: 9999, pointerEvents: 'auto' }}
+        >
+          <div 
+            className="bg-black/90 backdrop-blur-md border-2 border-neutral-700 rounded-2xl p-6 max-w-md w-full shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
             
             {/* Title */}
             <div className="flex items-center gap-3 mb-4">
@@ -770,13 +819,23 @@ export default function ChatPage() {
               {confirmationDialog.type === 'destructive' ? (
                 <>
                   <button
-                    onClick={cancelAction}
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      cancelAction();
+                    }}
                     className="flex-1 px-4 py-2.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-white font-medium transition"
                   >
                     ❌ No, Cancel
                   </button>
                   <button
-                    onClick={confirmAction}
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      confirmAction();
+                    }}
                     className="flex-1 px-4 py-2.5 rounded-lg bg-red-600 hover:bg-red-700 text-white font-bold transition"
                   >
                     ✅ Yes, Do It
@@ -785,7 +844,10 @@ export default function ChatPage() {
               ) : (
                 <>
                   <button
-                    onClick={() => {
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
                       cancelAction();
                       setInput(confirmationDialog.pipeline.original);
                     }}
@@ -794,7 +856,12 @@ export default function ChatPage() {
                     ✏️ Let Me Retype
                   </button>
                   <button
-                    onClick={confirmAction}
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      confirmAction();
+                    }}
                     className="flex-1 px-4 py-2.5 rounded-lg bg-green-600 hover:bg-green-700 text-white font-bold transition"
                   >
                     ✅ Yes, Proceed
@@ -805,6 +872,6 @@ export default function ChatPage() {
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
